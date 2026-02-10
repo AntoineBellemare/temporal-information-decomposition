@@ -299,6 +299,27 @@ def analyze_pid_lag_pairs(signal, lag_pairs, n_bins=4):
     return pd.DataFrame(results)
 
 
+def compute_dense_small_lag_sweep(signal, max_lag=15, n_bins=4):
+    """
+    Compute PID for ALL consecutive lag pairs up to max_lag.
+    
+    This produces the same dense sampling as the basic bandpass script,
+    allowing direct comparison at small timescales.
+    """
+    signal_discrete = discretize_timeseries(signal, n_bins=n_bins)
+    
+    results = []
+    for lag1 in range(1, max_lag):
+        for lag2 in range(lag1 + 1, max_lag + 1):
+            dist = build_embedding_distribution(signal_discrete, lags=[lag1, lag2])
+            pid = compute_pid_summary(dist)
+            pid['lag1'] = lag1
+            pid['lag2'] = lag2
+            results.append(pid)
+    
+    return pd.DataFrame(results)
+
+
 def analyze_with_preprocessing(signal, lags, lag_pairs, n_bins=4, preprocess='none'):
     """
     Analyze signal with optional preprocessing to remove autocorrelation artifacts.
@@ -333,12 +354,12 @@ def analyze_with_preprocessing(signal, lags, lag_pairs, n_bins=4, preprocess='no
 # VISUALIZATION FUNCTIONS
 # =============================================================================
 
-def plot_lag_profiles_by_band(all_results, channel, fs, save_path=None):
+def plot_lag_profiles_by_band(all_results, channel, fs, save_path=None, scale='log'):
     """
     Plot PID vs lag distance for each band for one channel.
     
-    Uses LOG x-axis for extended timescales.
-    Shows all PID components but with unique as lighter/thinner.
+    Args:
+        scale: 'log' for extended timescales, 'linear' for small lags
     """
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     axes = axes.flatten()
@@ -383,14 +404,15 @@ def plot_lag_profiles_by_band(all_results, channel, fs, save_path=None):
         ax.set_title(f'{band_name.upper()} ({BANDS[band_name][0]}-{BANDS[band_name][1]} Hz)')
         ax.legend(fontsize=8, loc='upper right')
         ax.grid(alpha=0.3)
-        ax.set_xscale('log')  # LOG SCALE for extended timescales
         
-        # Set reasonable x limits
-        ax.set_xlim(time_ms.min() * 0.8, time_ms.max() * 1.2)
+        if scale == 'log':
+            ax.set_xscale('log')
+            ax.set_xlim(time_ms.min() * 0.8, time_ms.max() * 1.2)
     
     axes[5].axis('off')
     
     # Add interpretation
+    scale_note = "X-axis is LOG SCALE (3ms → 1s)" if scale == 'log' else "X-axis is LINEAR SCALE"
     axes[5].text(0.1, 0.8, 
                  "INTERPRETATION:\n\n"
                  "• Redundancy (green): Shared info between lags\n"
@@ -399,18 +421,218 @@ def plot_lag_profiles_by_band(all_results, channel, fs, save_path=None):
                  "  High = nonlinear temporal integration\n\n"
                  "• Unique (blue, dashed): Asymmetric info\n"
                  "  Spikes = autocorrelation at periodic lags\n"
-                 "  (e.g., alpha ~100ms period)\n\n"
-                 "X-axis is LOG SCALE (3ms → 1s)",
+                 f"  (e.g., alpha ~100ms period)\n\n{scale_note}",
                  transform=axes[5].transAxes, fontsize=10,
                  bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
     
-    plt.suptitle(f'PID vs Lag Distance by Frequency Band: {channel} (log scale)', 
+    scale_label = "log scale" if scale == 'log' else "linear scale"
+    plt.suptitle(f'PID vs Lag Distance by Frequency Band: {channel} ({scale_label})', 
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+
+
+def plot_lag_profiles_dual_scale(all_results, channel, fs, save_path=None):
+    """
+    Plot PID vs lag distance with BOTH linear (small lags) and log (extended) scales.
+    
+    This allows direct comparison with the basic bandpass script at small scales,
+    while also showing extended timescale behavior.
+    """
+    band_order = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+    
+    fig, axes = plt.subplots(5, 2, figsize=(16, 20))
+    
+    for idx, band_name in enumerate(band_order):
+        ax_linear = axes[idx, 0]
+        ax_log = axes[idx, 1]
+        
+        if band_name not in all_results or channel not in all_results[band_name]:
+            ax_linear.set_title(f'{band_name.upper()} - No data')
+            ax_log.set_title(f'{band_name.upper()} - No data')
+            continue
+        
+        df = all_results[band_name][channel].copy()
+        df['lag_diff'] = df['lag2'] - df['lag1']
+        
+        grouped = df.groupby('lag_diff').agg({
+            'redundancy': ['mean', 'std'],
+            'synergy': ['mean', 'std'],
+            'unique_0': 'mean',
+            'unique_1': 'mean'
+        }).reset_index()
+        grouped.columns = ['lag_diff', 'red_mean', 'red_std', 'syn_mean', 'syn_std', 'uniq0', 'uniq1']
+        grouped['total_unique'] = grouped['uniq0'] + grouped['uniq1']
+        
+        time_ms = grouped['lag_diff'] / fs * 1000
+        
+        # Plot on both axes
+        for ax, is_log in [(ax_linear, False), (ax_log, True)]:
+            ax.errorbar(time_ms, grouped['red_mean'], yerr=grouped['red_std'],
+                       fmt='o-', color='green', label='Redundancy', capsize=3, 
+                       linewidth=2, markersize=5)
+            ax.errorbar(time_ms, grouped['syn_mean'], yerr=grouped['syn_std'],
+                       fmt='s-', color='red', label='Synergy', capsize=3, 
+                       linewidth=2, markersize=5)
+            ax.plot(time_ms, grouped['total_unique'], '^--', color='blue',
+                   label='Unique', linewidth=1.5, markersize=4, alpha=0.6)
+            
+            ax.set_ylabel('Information (bits)')
+            ax.grid(alpha=0.3)
+            
+            if is_log:
+                ax.set_xscale('log')
+                ax.set_title(f'{band_name.upper()} - Log Scale')
+                ax.set_xlim(time_ms.min() * 0.8, time_ms.max() * 1.2)
+            else:
+                ax.set_title(f'{band_name.upper()} - Linear Scale (compare w/ basic script)')
+                ax.set_xlim(0, min(60, time_ms.max()))  # Focus on first 60ms
+            
+            if idx == 0:
+                ax.legend(fontsize=8, loc='upper right')
+    
+    axes[-1, 0].set_xlabel('Lag Difference (ms)')
+    axes[-1, 1].set_xlabel('Lag Difference (ms)')
+    
+    plt.suptitle(f'PID Lag Profiles - Dual Scale Comparison: {channel}\n'
+                 f'Left: Linear scale (matches basic script) | Right: Log scale (extended)',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def plot_small_lag_heatmaps(dense_results, channel, fs, save_path=None):
+    """
+    Plot heatmaps for small lags (like basic script) for direct comparison.
+    
+    Args:
+        dense_results: {band: {channel: DataFrame}} from compute_dense_small_lag_sweep
+    """
+    n_bands = len(BANDS)
+    fig, axes = plt.subplots(2, n_bands, figsize=(4*n_bands, 8))
+    
+    band_order = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+    
+    for idx, band_name in enumerate(band_order):
+        if band_name not in dense_results or channel not in dense_results[band_name]:
+            continue
+            
+        df = dense_results[band_name][channel]
+        max_lag = int(df['lag2'].max())
+        lags = list(range(1, max_lag + 1))
+        n_lags = len(lags)
+        
+        # Redundancy and Synergy matrices
+        red_matrix = np.full((n_lags, n_lags), np.nan)
+        syn_matrix = np.full((n_lags, n_lags), np.nan)
+        
+        for _, row in df.iterrows():
+            i = int(row['lag1']) - 1
+            j = int(row['lag2']) - 1
+            red_matrix[i, j] = row['redundancy']
+            syn_matrix[i, j] = row['synergy']
+        
+        # Plot redundancy
+        mask = np.isnan(red_matrix)
+        sns.heatmap(red_matrix, ax=axes[0, idx], cmap='Greens', mask=mask,
+                    xticklabels=5, yticklabels=5, cbar_kws={'label': 'bits'})
+        axes[0, idx].set_title(f'{band_name.upper()}\nRedundancy')
+        axes[0, idx].set_xlabel('Lag 2')
+        axes[0, idx].set_ylabel('Lag 1' if idx == 0 else '')
+        
+        # Plot synergy
+        sns.heatmap(syn_matrix, ax=axes[1, idx], cmap='Reds', mask=mask,
+                    xticklabels=5, yticklabels=5, cbar_kws={'label': 'bits'})
+        axes[1, idx].set_title('Synergy')
+        axes[1, idx].set_xlabel('Lag 2')
+        axes[1, idx].set_ylabel('Lag 1' if idx == 0 else '')
+    
+    plt.suptitle(f'Small-Lag PID Heatmaps: {channel}\n(Dense sampling, matches basic script)', 
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def plot_synergy_peaks_analysis(all_results, fs, save_path=None):
+    """
+    Find and plot where synergy peaks for each band and channel.
+    (Ported from basic script)
+    """
+    summary = []
+    band_order = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+    
+    for band_name in band_order:
+        if band_name not in all_results:
+            continue
+        for ch, df in all_results[band_name].items():
+            # Find peak synergy
+            peak_idx = df['synergy'].idxmax()
+            peak_row = df.loc[peak_idx]
+            
+            summary.append({
+                'band': band_name,
+                'channel': ch.replace('eeg-', ''),
+                'peak_lag1': int(peak_row['lag1']),
+                'peak_lag2': int(peak_row['lag2']),
+                'peak_lag_diff': int(peak_row['lag2'] - peak_row['lag1']),
+                'peak_synergy': peak_row['synergy'],
+                'peak_time_ms': (peak_row['lag2'] - peak_row['lag1']) / fs * 1000
+            })
+    
+    df_summary = pd.DataFrame(summary)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Box plot of peak lag timing by band
+    df_summary['band'] = pd.Categorical(df_summary['band'], categories=band_order, ordered=True)
+    
+    colors = [BAND_COLORS[b] for b in band_order if b in df_summary['band'].unique()]
+    box_data = [df_summary[df_summary['band'] == b]['peak_time_ms'].values 
+                for b in band_order if b in df_summary['band'].unique()]
+    box_labels = [b.upper() for b in band_order if b in df_summary['band'].unique()]
+    
+    bp = axes[0].boxplot(box_data, labels=box_labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    
+    axes[0].set_xlabel('Frequency Band')
+    axes[0].set_ylabel('Peak Synergy Time (ms)')
+    axes[0].set_title('At What Timescale Does Synergy Peak?')
+    axes[0].grid(axis='y', alpha=0.3)
+    
+    # Scatter of peak synergy value vs time
+    for band in band_order:
+        if band not in df_summary['band'].unique():
+            continue
+        band_data = df_summary[df_summary['band'] == band]
+        axes[1].scatter(band_data['peak_time_ms'], band_data['peak_synergy'],
+                       color=BAND_COLORS[band], label=band.upper(), alpha=0.7, s=50)
+    
+    axes[1].set_xlabel('Peak Synergy Timescale (ms)')
+    axes[1].set_ylabel('Peak Synergy Value (bits)')
+    axes[1].set_title('Peak Synergy: Magnitude vs Timescale')
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    axes[1].set_xscale('log')
+    
+    plt.suptitle('Synergy Peak Analysis by Frequency Band', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    return df_summary
 
 
 def plot_mi_by_band(all_mi_results, channel, fs, save_path=None):
@@ -1034,7 +1256,10 @@ def main():
     TIMESCALES_MS = [3, 7, 10, 15, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000]
     LAGS = create_lag_schedule(fs, TIMESCALES_MS)
     
-    # ALL lag pairs
+    # Small-lag parameters (for direct comparison with basic script)
+    MAX_LAG_SMALL = 15  # ~50ms at 300Hz, same as basic script
+    
+    # ALL lag pairs for extended analysis
     LAG_PAIRS = []
     for i, lag1 in enumerate(LAGS):
         for lag2 in LAGS[i+1:]:
@@ -1051,11 +1276,15 @@ def main():
     print(f"  Timescales: {TIMESCALES_MS} ms")
     print(f"  Lags: {LAGS}")
     print(f"  Lag pairs: {len(LAG_PAIRS)}")
+    print(f"  Small-lag max: {MAX_LAG_SMALL} (~{MAX_LAG_SMALL/fs*1000:.1f}ms, matches basic script)")
     print(f"  Bands: {list(BANDS.keys())}")
     print(f"  Preprocessing: {PREPROCESS_MODES}")
     
     # Storage: {preprocess: {band: {channel: DataFrame}}}
     all_results = {}
+    
+    # Dense small-lag results (for comparison with basic script)
+    dense_small_lag_results = {}
     
     for preprocess_mode in PREPROCESS_MODES:
         print(f"\n{'#'*70}")
@@ -1096,6 +1325,15 @@ def main():
                     if df_mi is None or df_pid is None:
                         print("✗ insufficient data after preprocessing")
                         continue
+                    
+                    # Also compute dense small-lag sweep (only for 'none' mode)
+                    if preprocess_mode == 'none':
+                        if band_name not in dense_small_lag_results:
+                            dense_small_lag_results[band_name] = {}
+                        df_small = compute_dense_small_lag_sweep(filtered, max_lag=MAX_LAG_SMALL, n_bins=N_BINS)
+                        df_small['channel'] = ch
+                        df_small['band'] = band_name
+                        dense_small_lag_results[band_name][ch] = df_small
                     
                     df_mi['channel'] = ch
                     df_mi['band'] = band_name
@@ -1179,7 +1417,7 @@ def main():
     plot_all_bands_grid(all_pid_results, metric='redundancy',
                         save_path=RESULTS_DIR / "all_bands_grid_redundancy.png")
     
-    # 5. Key channel analyses
+    # 5. Key channel analyses (extended + small-lag comparison)
     print("5. Individual channel analyses...")
     key_channels = ['eeg-Fz', 'eeg-O1', 'eeg-Cz', 'eeg-T3']
     
@@ -1188,8 +1426,22 @@ def main():
             continue
         ch_name = ch.replace('eeg-', '')
         
-        plot_lag_profiles_by_band(all_pid_results, ch, fs,
-                                  save_path=RESULTS_DIR / f"lag_profiles_{ch_name}.png")
+        # Log-scale profiles (extended timescales)
+        plot_lag_profiles_by_band(all_pid_results, ch, fs, scale='log',
+                                  save_path=RESULTS_DIR / f"lag_profiles_{ch_name}_log.png")
+        
+        # Linear-scale profiles (small timescales, matches basic script)
+        plot_lag_profiles_by_band(all_pid_results, ch, fs, scale='linear',
+                                  save_path=RESULTS_DIR / f"lag_profiles_{ch_name}_linear.png")
+        
+        # Dual-scale comparison (both in one figure)
+        plot_lag_profiles_dual_scale(all_pid_results, ch, fs,
+                                     save_path=RESULTS_DIR / f"lag_profiles_{ch_name}_dual.png")
+        
+        # Dense small-lag heatmaps (matches basic script exactly)
+        if dense_small_lag_results:
+            plot_small_lag_heatmaps(dense_small_lag_results, ch, fs,
+                                    save_path=RESULTS_DIR / f"small_lag_heatmaps_{ch_name}.png")
         
         plot_mi_by_band(all_mi_results, ch, fs,
                         save_path=RESULTS_DIR / f"mi_by_band_{ch_name}.png")
@@ -1200,8 +1452,14 @@ def main():
         plot_band_heatmaps_extended(all_pid_results, ch, fs, metric='redundancy',
                                     save_path=RESULTS_DIR / f"redundancy_bands_{ch_name}.png")
     
-    # 6. RAW vs WHITENED comparison
-    print("\n6. Raw vs Whitened comparison...")
+    # 6. Synergy peaks analysis
+    print("\n6. Synergy peaks analysis...")
+    df_peaks = plot_synergy_peaks_analysis(all_pid_results, fs,
+                                           save_path=RESULTS_DIR / "synergy_peaks.png")
+    df_peaks.to_csv(RESULTS_DIR / "synergy_peaks.csv", index=False)
+    
+    # 7. RAW vs WHITENED comparison
+    print("\n7. Raw vs Whitened comparison...")
     plot_raw_vs_whitened_comparison(all_pid_results, whitened_pid_results, fs, channels,
                                     save_path=RESULTS_DIR / "raw_vs_whitened_comparison.png")
     

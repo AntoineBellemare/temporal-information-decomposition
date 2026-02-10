@@ -832,6 +832,217 @@ SURROGATE COMPARISON
     plt.close()
 
 
+def plot_mean_vs_divergence(results, tau_values, save_dir, channel='all'):
+    """
+    Scatter plot: Mean value vs Divergence for each metric.
+    
+    This reveals whether high/low values correlate with scale-invariance.
+    Key insight from phiid_lag_divergence_analysis.py:
+    - Storage r=0.622: Higher storage = more multi-scale divergence
+    - Transfer r=-0.727: Higher transfer = MORE scale-invariant (low divergence)
+    - Erasure r=0.724: Higher erasure = more divergence
+    - Integrated r=0.117: No clear relationship (complex dynamics)
+    """
+    metrics = list(DYNAMICS_GROUPS.keys())
+    n_metrics = len(metrics)
+    n_cols = 2
+    n_rows = (n_metrics + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    axes = axes.flatten()
+    
+    for idx, metric_name in enumerate(metrics):
+        ax = axes[idx]
+        m = results[metric_name]
+        
+        # Mean across taus at each timepoint
+        raw_matrix = np.array([m['raw_by_tau'][tau] for tau in tau_values])
+        mean_values = np.mean(raw_matrix, axis=0)
+        div_values = m['normalized_divergence']
+        
+        # Scatter
+        ax.scatter(mean_values, div_values, alpha=0.3, s=10, c='steelblue')
+        
+        # Compute correlation
+        valid = np.isfinite(mean_values) & np.isfinite(div_values)
+        if np.sum(valid) > 10:
+            corr = np.corrcoef(mean_values[valid], div_values[valid])[0, 1]
+            ax.text(0.05, 0.95, f'r = {corr:.3f}', transform=ax.transAxes, 
+                   fontsize=12, fontweight='bold', verticalalignment='top')
+        
+        ax.set_xlabel(f'Mean {metric_name} (bits)')
+        ax.set_ylabel('Divergence (std across τ)')
+        ax.set_title(metric_name.replace('_', ' ').title())
+        ax.grid(alpha=0.3)
+    
+    # Hide unused axes
+    for idx in range(n_metrics, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(f'Relationship: Mean Value vs Divergence Across τ (Takens v3) - {channel}', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_dir / f"mean_vs_divergence_{channel}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def compute_cross_channel_synchrony(all_channel_results, tau_values, fs):
+    """
+    Compute cross-channel synchrony in PhiID metrics.
+    
+    For each pair of channels, computes:
+    - Correlation of TII timeseries (do they integrate at same times?)
+    - PLV of metric timeseries (phase-locked?)
+    - Granger causality (does one lead?)
+    
+    Parameters
+    ----------
+    all_channel_results : dict
+        {channel: results} where results is output of analyze_channel
+    tau_values : list
+        Tau values used
+    fs : float
+        Sampling frequency
+    
+    Returns
+    -------
+    sync_results : dict
+        Cross-channel synchrony metrics
+    """
+    channels = list(all_channel_results.keys())
+    n_channels = len(channels)
+    
+    if n_channels < 2:
+        return {}
+    
+    sync_results = {}
+    
+    for metric_name in DYNAMICS_GROUPS.keys():
+        # TII correlation matrix
+        tii_matrix = np.zeros((n_channels, n_channels))
+        plv_matrix = np.zeros((n_channels, n_channels))
+        
+        for i, ch1 in enumerate(channels):
+            tii1 = all_channel_results[ch1][metric_name]['tii']
+            
+            for j, ch2 in enumerate(channels):
+                if i == j:
+                    tii_matrix[i, j] = 1.0
+                    plv_matrix[i, j] = 1.0
+                    continue
+                
+                tii2 = all_channel_results[ch2][metric_name]['tii']
+                
+                # Ensure same length
+                min_len = min(len(tii1), len(tii2))
+                t1, t2 = tii1[:min_len], tii2[:min_len]
+                
+                # Correlation
+                if np.std(t1) > 0 and np.std(t2) > 0:
+                    corr = np.corrcoef(t1, t2)[0, 1]
+                    tii_matrix[i, j] = corr if np.isfinite(corr) else 0
+                
+                # PLV
+                try:
+                    phase1 = np.angle(hilbert(t1 - np.mean(t1)))
+                    phase2 = np.angle(hilbert(t2 - np.mean(t2)))
+                    plv = np.abs(np.mean(np.exp(1j * (phase1 - phase2))))
+                    plv_matrix[i, j] = plv
+                except:
+                    plv_matrix[i, j] = 0
+        
+        # Global synchrony index (mean off-diagonal correlation)
+        triu_indices = np.triu_indices(n_channels, k=1)
+        global_corr = np.mean(tii_matrix[triu_indices])
+        global_plv = np.mean(plv_matrix[triu_indices])
+        
+        sync_results[metric_name] = {
+            'channels': channels,
+            'tii_correlation_matrix': tii_matrix,
+            'plv_matrix': plv_matrix,
+            'global_tii_sync': global_corr,
+            'global_plv': global_plv,
+        }
+    
+    return sync_results
+
+
+def plot_cross_channel_synchrony(sync_results, save_dir):
+    """
+    Visualize cross-channel synchrony.
+    """
+    if not sync_results:
+        return
+    
+    metrics = list(sync_results.keys())
+    n_metrics = len(metrics)
+    
+    fig, axes = plt.subplots(2, n_metrics, figsize=(4 * n_metrics, 8))
+    if n_metrics == 1:
+        axes = axes.reshape(-1, 1)
+    
+    for col, metric_name in enumerate(metrics):
+        data = sync_results[metric_name]
+        channels = data['channels']
+        short_channels = [c.replace('eeg-', '') for c in channels]
+        
+        # TII correlation
+        ax = axes[0, col]
+        im = ax.imshow(data['tii_correlation_matrix'], cmap='RdBu_r', vmin=-1, vmax=1)
+        ax.set_xticks(range(len(channels)))
+        ax.set_yticks(range(len(channels)))
+        ax.set_xticklabels(short_channels, rotation=45)
+        ax.set_yticklabels(short_channels)
+        ax.set_title(f'{metric_name}\nTII Correlation (r={data["global_tii_sync"]:.3f})')
+        plt.colorbar(im, ax=ax)
+        
+        # PLV
+        ax = axes[1, col]
+        im = ax.imshow(data['plv_matrix'], cmap='hot', vmin=0, vmax=1)
+        ax.set_xticks(range(len(channels)))
+        ax.set_yticks(range(len(channels)))
+        ax.set_xticklabels(short_channels, rotation=45)
+        ax.set_yticklabels(short_channels)
+        ax.set_title(f'PLV (mean={data["global_plv"]:.3f})')
+        plt.colorbar(im, ax=ax)
+    
+    plt.suptitle('Cross-Channel Synchrony (Takens v3)', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_dir / "cross_channel_synchrony.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Summary bar chart
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    x = np.arange(n_metrics)
+    
+    # Global TII Sync
+    global_tii = [sync_results[m]['global_tii_sync'] for m in metrics]
+    axes[0].bar(x, global_tii, alpha=0.7, edgecolor='black')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([m.replace('_', '\n') for m in metrics])
+    axes[0].set_ylabel('Mean Cross-Channel TII Correlation')
+    axes[0].set_title('Global TII Synchrony')
+    axes[0].axhline(0, color='gray', linestyle='--')
+    axes[0].grid(alpha=0.3, axis='y')
+    
+    # Global PLV
+    global_plv = [sync_results[m]['global_plv'] for m in metrics]
+    axes[1].bar(x, global_plv, alpha=0.7, edgecolor='black', color='purple')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([m.replace('_', '\n') for m in metrics])
+    axes[1].set_ylabel('Mean Cross-Channel PLV')
+    axes[1].set_title('Global Phase Synchrony')
+    axes[1].axhline(0.5, color='red', linestyle='--', label='Threshold')
+    axes[1].legend()
+    axes[1].grid(alpha=0.3, axis='y')
+    
+    plt.suptitle('Cross-Channel Synchrony Summary', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_dir / "cross_channel_summary.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def main():
     print("=" * 70)
     print("TEMPORAL INTEGRATION ANALYSIS v3 (Takens Embedding)")
@@ -889,6 +1100,7 @@ def main():
     print(f"\nTemporal structure: t, t+τ, t+2τ, t+3τ (perfectly regular)")
     
     all_summaries = []
+    all_channel_results = {}  # For cross-channel analysis
     
     for channel in channels:
         print(f"\n{'='*50}")
@@ -915,6 +1127,13 @@ def main():
             time_sec, TAU_VALUES, FS, channel, RESULTS_DIR
         )
         
+        # Mean vs Divergence plot
+        print("  Generating mean vs divergence plot...")
+        plot_mean_vs_divergence(results, TAU_VALUES, RESULTS_DIR, channel)
+        
+        # Store results for cross-channel analysis
+        all_channel_results[channel] = results
+        
         # Collect summary
         summary = {'channel': channel, 'optimal_tau': tau_opt}
         for metric_name in DYNAMICS_GROUPS.keys():
@@ -928,6 +1147,19 @@ def main():
             summary[f'{metric_name}_plv'] = pc['plv']
         
         all_summaries.append(summary)
+    
+    # Cross-channel analysis
+    if len(all_channel_results) >= 2:
+        print("\n" + "=" * 50)
+        print("CROSS-CHANNEL SYNCHRONY ANALYSIS")
+        print("=" * 50)
+        sync_results = compute_cross_channel_synchrony(all_channel_results, TAU_VALUES, FS)
+        plot_cross_channel_synchrony(sync_results, RESULTS_DIR)
+        
+        # Add to summary
+        for metric_name in DYNAMICS_GROUPS.keys():
+            print(f"  {metric_name}: Global TII sync = {sync_results[metric_name]['global_tii_sync']:.3f}, "
+                  f"PLV = {sync_results[metric_name]['global_plv']:.3f}")
     
     # Save summary
     df_summary = pd.DataFrame(all_summaries)

@@ -13,7 +13,7 @@ This project applies information-theoretic decomposition methods to understand h
 - **Synergy**: Information that requires BOTH past points together
 - **Unique**: Information from each past point alone
 
-**Temporal PhiID**: Treat a signal as a pseudo-bivariate system (signal vs time-shifted self) and decompose into 16 atoms capturing:
+**Temporal PhiID**: Use Takens delay embedding to construct a pseudo-bivariate system and decompose into 16 atoms capturing:
 - Storage, Transfer, Copy, Erasure
 - Upward and Downward causation
 - Integrated information (Φ)
@@ -21,35 +21,30 @@ This project applies information-theoretic decomposition methods to understand h
 ## Project Structure
 
 ```
-temporal-phiid/
+temporal-information-decomposition/
 ├── scripts/
 │   ├── pid/                    # PID analysis scripts
-│   │   ├── temporal_pid_analysis.py      # Toy systems (COPY, XOR, AR)
-│   │   ├── kuramoto_temporal_pid.py      # Kuramoto oscillators
-│   │   ├── eeg_temporal_pid_analysis.py  # Basic EEG analysis
-│   │   ├── eeg_temporal_pid_extended.py  # Extended lags (up to 1s)
-│   │   ├── eeg_bandpass_temporal_pid.py  # Frequency band analysis
-│   │   └── eeg_bandpass_extended.py      # Full analysis + prewhitening
+│   │   ├── toy_examples.py               # Toy systems (COPY, XOR, AR)
+│   │   ├── kuramoto.py                   # Kuramoto oscillators
+│   │   ├── eeg.py                        # Basic EEG analysis
+│   │   ├── eeg_bandpass.py               # Frequency band EEG analysis
+│   │   └── biosignal_comparison.py       # Cross-biosignal comparison
 │   │
-│   └── phiid/                  # PhiID analysis scripts
-│       ├── toy_phiid_analysis.py         # Toy systems validation
-│       └── eeg_phiid_temporal.py         # EEG PhiID analysis
+│   ├── phiid/                  # PhiID analysis scripts
+│   │   ├── toy_examples.py               # Toy systems validation
+│   │   ├── eeg_phiid_temporal.py         # EEG PhiID (frequency bands)
+│   │   └── temporal_integration_index_eeg.py  # Temporal Integration Index
+│   │
+│   └── utils/                  # Shared utilities
+│       └── estimate_tau.py               # Timescale estimation
 │
 ├── results/
-│   ├── pid/
-│   │   ├── toy_systems/        # Validation on COPY, XOR, AR
-│   │   ├── kuramoto/           # Kuramoto oscillator results
-│   │   ├── eeg_basic/          # Basic EEG (short lags)
-│   │   ├── eeg_extended/       # Extended lags
-│   │   ├── eeg_bandpass/       # Frequency band analysis
-│   │   └── eeg_bandpass_extended/
-│   │
-│   └── phiid/
-│       ├── toy_systems/        # PhiID toy validation
-│       └── eeg/                # PhiID EEG results
+│   ├── pid/                    # PID analysis outputs
+│   └── phiid/                  # PhiID analysis outputs
 │
 ├── notebooks/                  # Jupyter notebooks for exploration
 ├── data/                       # EEG and other data files
+├── docs/                       # Documentation
 └── requirements.txt
 ```
 
@@ -57,12 +52,12 @@ temporal-phiid/
 
 ```bash
 # Clone the repository
-git clone https://github.com/antoinebellemare/temporal-phiid.git
-cd temporal-phiid
+git clone https://github.com/yourusername/temporal-information-decomposition.git
+cd temporal-information-decomposition
 
-# Create virtual environment (optional but recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create conda environment (recommended)
+conda create -n phiid python=3.10
+conda activate phiid
 
 # Install dependencies
 pip install -r requirements.txt
@@ -74,23 +69,26 @@ pip install -r requirements.txt
 
 ```bash
 # Toy systems validation
-python scripts/pid/temporal_pid_analysis.py
+python scripts/pid/toy_examples.py
 
 # Kuramoto oscillators
-python scripts/pid/kuramoto_temporal_pid.py
+python scripts/pid/kuramoto.py
 
 # EEG analysis (requires data in data/ folder)
-python scripts/pid/eeg_bandpass_extended.py
+python scripts/pid/eeg_bandpass.py
 ```
 
 ### Run PhiID Analysis
 
 ```bash
 # Toy systems validation
-python scripts/phiid/toy_phiid_analysis.py
+python scripts/phiid/toy_examples.py
 
-# EEG PhiID analysis
+# EEG PhiID analysis (frequency bands with Takens embedding)
 python scripts/phiid/eeg_phiid_temporal.py
+
+# Temporal Integration Index
+python scripts/phiid/temporal_integration_index_eeg.py
 ```
 
 ## Key Concepts
@@ -101,10 +99,11 @@ python scripts/phiid/eeg_phiid_temporal.py
 - 4 atoms: Redundancy, Unique₁, Unique₂, Synergy
 
 ### PhiID (Integrated Information Decomposition)
-- Uses the `phyid` library
-- Analyzes bivariate temporal relationships
+- Uses the `phyid` library with Takens delay embedding
+- Constructs 4-vectors: [t, t+τ, t+2τ, t+3τ] where τ probes different timescales
 - 16 atoms organized into information dynamics categories
-- Computes IIT-related metrics (Φ, causal density, etc.)
+- ACF-aware τ selection to avoid trivial autocorrelation
+- Supports broadband (LRTC) and narrowband (oscillatory) analysis
 
 ### Key Findings from Toy Systems
 
@@ -120,6 +119,7 @@ python scripts/phiid/eeg_phiid_temporal.py
 - Williams, P. L., & Beer, R. D. (2010). Nonnegative decomposition of multivariate information.
 - Mediano, P. A., et al. (2021). Towards an extended taxonomy of information dynamics via Integrated Information Decomposition.
 - Lizier, J. T. (2012). The local information dynamics of distributed computation in complex systems.
+- Takens, F. (1981). Detecting strange attractors in turbulence.
 
 ## License
 

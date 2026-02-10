@@ -84,7 +84,9 @@ IIT_METRICS = {
 }
 
 # Frequency bands
+# Frequency bands - including BROADBAND for LRTC analysis
 BANDS = {
+    'broadband': (0.5, 45),   # Full EEG range - preserves LRTC/1/f structure!
     'delta': (1, 4),
     'theta': (4, 8),
     'alpha': (8, 13),
@@ -93,6 +95,7 @@ BANDS = {
 }
 
 BAND_COLORS = {
+    'broadband': '#000000',  # Black for broadband
     'delta': '#1f77b4',
     'theta': '#2ca02c',
     'alpha': '#ff7f0e',
@@ -116,6 +119,57 @@ def bandpass_filter(data, lowcut, highcut, fs, order=4):
         return sig.filtfilt(b, a, data)
     except:
         return sig.lfilter(b, a, data)
+
+
+def highpass_filter(data, cutoff, fs, order=4):
+    """Apply Butterworth highpass filter (for broadband with LRTC)."""
+    nyq = 0.5 * fs
+    high = max(0.001, min(cutoff / nyq, 0.99))
+    
+    b, a = sig.butter(order, high, btype='high')
+    try:
+        return sig.filtfilt(b, a, data)
+    except:
+        return sig.lfilter(b, a, data)
+
+
+def compute_amplitude_envelope(data, lowcut, highcut, fs, smooth_ms=100):
+    """
+    Compute amplitude envelope of a bandpass-filtered signal.
+    
+    The amplitude envelope preserves LRTC even when the narrowband
+    oscillation itself decorrelates quickly!
+    
+    Parameters
+    ----------
+    data : array
+        Raw signal
+    lowcut, highcut : float
+        Band limits in Hz
+    fs : float
+        Sampling frequency
+    smooth_ms : float
+        Smoothing window in ms for envelope
+    
+    Returns
+    -------
+    envelope : array
+        Amplitude envelope (always positive, slow fluctuations)
+    """
+    # Bandpass filter
+    filtered = bandpass_filter(data, lowcut, highcut, fs)
+    
+    # Hilbert transform for analytic signal
+    analytic = sig.hilbert(filtered)
+    envelope = np.abs(analytic)
+    
+    # Smooth the envelope (optional, reduces high-freq noise)
+    if smooth_ms > 0:
+        smooth_samples = max(1, int(smooth_ms * fs / 1000))
+        kernel = np.ones(smooth_samples) / smooth_samples
+        envelope = np.convolve(envelope, kernel, mode='same')
+    
+    return envelope
 
 
 def estimate_decorrelation_tau(signal, fs, threshold=0.5, max_tau_ms=500):
@@ -469,8 +523,9 @@ def plot_iit_summary(df_iit, channel, fs, save_path=None):
 
 
 def plot_band_comparison_phiid(all_results, metric, fs, save_path=None):
-    """Compare a specific metric across bands."""
+    """Compare a specific metric across bands with dual y-axis for broadband."""
     fig, ax = plt.subplots(figsize=(12, 6))
+    ax2 = ax.twinx()  # Secondary y-axis for broadband
     
     for band_name, results in all_results.items():
         if results is None:
@@ -486,14 +541,27 @@ def plot_band_comparison_phiid(all_results, metric, fs, save_path=None):
         
         time_ms = grouped['tau_embed'] / fs * 1000
         
-        ax.errorbar(time_ms, grouped['mean'], yerr=grouped['std'],
-                   fmt='o-', color=BAND_COLORS[band_name], label=band_name.upper(),
-                   linewidth=2, capsize=3)
+        # Use secondary axis for broadband (different scale)
+        if band_name == 'broadband':
+            ax2.errorbar(time_ms, grouped['mean'], yerr=grouped['std'],
+                        fmt='s--', color=BAND_COLORS[band_name], label=f'{band_name.upper()} (right axis)',
+                        linewidth=2, capsize=3, markersize=8)
+        else:
+            ax.errorbar(time_ms, grouped['mean'], yerr=grouped['std'],
+                       fmt='o-', color=BAND_COLORS[band_name], label=band_name.upper(),
+                       linewidth=2, capsize=3)
     
     ax.set_xlabel('τ Embedding Delay (ms)')
-    ax.set_ylabel(f'{metric} (bits)')
+    ax.set_ylabel(f'{metric} (bits) - Narrowband', color='black')
+    ax2.set_ylabel(f'{metric} (bits) - BROADBAND', color=BAND_COLORS['broadband'])
+    ax2.tick_params(axis='y', labelcolor=BAND_COLORS['broadband'])
     ax.set_title(f'{metric.replace("_", " ")} Across Frequency Bands (Takens)')
-    ax.legend()
+    
+    # Combine legends
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
     ax.grid(alpha=0.3)
     ax.set_xscale('log')
     
@@ -502,79 +570,282 @@ def plot_band_comparison_phiid(all_results, metric, fs, save_path=None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
 
+def plot_band_all_channels(band_results, band_name, fs, save_path=None):
+    """
+    Consolidated plot for one band showing all channels and metrics.
+    One figure per band with all channels as subplots.
+    """
+    channels = [ch for ch, r in band_results.items() if r is not None]
+    if not channels:
+        return
+    
+    n_channels = len(channels)
+    metrics = ['Storage', 'Transfer', 'Copy', 'Erasure', 'Downward_causation', 'Upward_causation']
+    
+    fig, axes = plt.subplots(len(metrics), n_channels, figsize=(4*n_channels, 3*len(metrics)))
+    if n_channels == 1:
+        axes = axes.reshape(-1, 1)
+    
+    channel_colors = plt.cm.tab10(np.linspace(0, 1, n_channels))
+    
+    for col, ch in enumerate(channels):
+        results = band_results[ch]
+        if results is None:
+            continue
+        
+        df_dyn = results['dynamics']
+        time_ms = df_dyn['tau_embed'] / fs * 1000
+        ch_short = ch.replace('eeg-', '')
+        
+        for row, metric in enumerate(metrics):
+            ax = axes[row, col]
+            ax.plot(time_ms, df_dyn[metric], 'o-', color=channel_colors[col], 
+                   linewidth=2, markersize=4)
+            ax.set_xscale('log')
+            ax.grid(alpha=0.3)
+            
+            if row == 0:
+                ax.set_title(ch_short, fontsize=12, fontweight='bold')
+            if col == 0:
+                ax.set_ylabel(metric.replace('_', '\n'), fontsize=9)
+            if row == len(metrics) - 1:
+                ax.set_xlabel('τ (ms)')
+    
+    plt.suptitle(f'{band_name.upper()} Band - Information Dynamics', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def plot_all_bands_summary(all_results, fs, save_path=None):
+    """
+    Master summary: rows=bands, cols=key metrics, averaged across channels.
+    """
+    band_order = ['broadband', 'delta', 'theta', 'alpha', 'beta', 'gamma']
+    metrics = ['Storage', 'Transfer', 'Integrated_info']
+    
+    fig, axes = plt.subplots(len(band_order), len(metrics), figsize=(5*len(metrics), 3*len(band_order)))
+    
+    for row, band_name in enumerate(band_order):
+        if band_name not in all_results or all_results[band_name] is None:
+            for col in range(len(metrics)):
+                axes[row, col].text(0.5, 0.5, 'No data', ha='center', va='center')
+                axes[row, col].set_xticks([])
+                axes[row, col].set_yticks([])
+            continue
+        
+        band_results = all_results[band_name]
+        channels = [ch for ch, r in band_results.items() if r is not None]
+        
+        for col, metric in enumerate(metrics):
+            ax = axes[row, col]
+            
+            # Get data source (dynamics or iit)
+            if metric == 'Integrated_info':
+                dfs = [band_results[ch]['iit'] for ch in channels if band_results[ch] is not None]
+            else:
+                dfs = [band_results[ch]['dynamics'] for ch in channels if band_results[ch] is not None]
+            
+            if not dfs:
+                continue
+            
+            # Plot each channel
+            for i, ch in enumerate(channels):
+                if band_results[ch] is None:
+                    continue
+                if metric == 'Integrated_info':
+                    df = band_results[ch]['iit']
+                else:
+                    df = band_results[ch]['dynamics']
+                
+                time_ms = df['tau_embed'] / fs * 1000
+                ch_short = ch.replace('eeg-', '')
+                ax.plot(time_ms, df[metric], 'o-', alpha=0.7, markersize=3,
+                       label=ch_short if row == 0 else None)
+            
+            ax.set_xscale('log')
+            ax.grid(alpha=0.3)
+            
+            # Labels
+            if row == 0:
+                ax.set_title(metric.replace('_', ' '), fontsize=12, fontweight='bold')
+                ax.legend(fontsize=7, loc='upper right')
+            if col == 0:
+                ax.set_ylabel(f'{band_name.upper()}\n(bits)', fontsize=10)
+            if row == len(band_order) - 1:
+                ax.set_xlabel('τ (ms)')
+    
+    plt.suptitle('PhiID Temporal Analysis: All Bands × Key Metrics', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def plot_atoms_heatmap_all_channels(band_results, band_name, fs, save_path=None):
+    """
+    Heatmap of atoms for all channels in one band, side by side.
+    """
+    channels = [ch for ch, r in band_results.items() if r is not None]
+    if not channels:
+        return
+    
+    n_channels = len(channels)
+    fig, axes = plt.subplots(1, n_channels, figsize=(5*n_channels, 8))
+    if n_channels == 1:
+        axes = [axes]
+    
+    atom_cols = ['rtr', 'rtx', 'rty', 'rts', 'xtr', 'xtx', 'xty', 'xts',
+                 'ytr', 'ytx', 'yty', 'yts', 'str', 'stx', 'sty', 'sts']
+    
+    # Find global min/max for consistent colorbar
+    all_vals = []
+    for ch in channels:
+        if band_results[ch] is not None:
+            df = band_results[ch]['atoms']
+            all_vals.extend(df[atom_cols].values.flatten())
+    if all_vals:
+        vmin, vmax = np.percentile(all_vals, [5, 95])
+        vmax = max(abs(vmin), abs(vmax))
+        vmin = -vmax
+    else:
+        vmin, vmax = -1, 1
+    
+    for i, ch in enumerate(channels):
+        ax = axes[i]
+        if band_results[ch] is None:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center')
+            continue
+        
+        df = band_results[ch]['atoms']
+        matrix = df[atom_cols].values.T
+        time_labels = [f'{int(t/fs*1000)}' for t in df['tau_embed']]
+        
+        im = ax.imshow(matrix, aspect='auto', cmap='RdBu_r', vmin=vmin, vmax=vmax)
+        ax.set_xticks(range(len(time_labels)))
+        ax.set_xticklabels(time_labels, rotation=45, fontsize=8)
+        ax.set_yticks(range(len(atom_cols)))
+        ax.set_yticklabels(atom_cols, fontsize=8)
+        ax.set_xlabel('τ (ms)')
+        ax.set_title(ch.replace('eeg-', ''), fontsize=12, fontweight='bold')
+        
+        if i == 0:
+            ax.set_ylabel('PhiID Atom')
+    
+    # Add colorbar
+    cbar = fig.colorbar(im, ax=axes, shrink=0.6, label='bits')
+    
+    plt.suptitle(f'{band_name.upper()} - PhiID Atoms (All Channels)', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
 
 def plot_grand_summary_phiid(all_results, fs, save_path=None):
-    """Grand summary of PhiID analysis."""
-    fig = plt.figure(figsize=(20, 12))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    """Grand summary of PhiID analysis with proper broadband visibility."""
+    fig = plt.figure(figsize=(24, 16))
+    gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
     
-    band_order = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+    # Include broadband first to show LRTC comparison
+    band_order = ['broadband', 'delta', 'theta', 'alpha', 'beta', 'gamma']
+    narrowband_order = ['delta', 'theta', 'alpha', 'beta', 'gamma']
     
-    # Panel A: Storage across bands
-    ax_storage = fig.add_subplot(gs[0, 0])
-    for band_name in band_order:
+    # Helper to get grouped data for a metric
+    def get_band_data(band_name, metric, source='dynamics'):
         if band_name not in all_results or all_results[band_name] is None:
-            continue
-        dfs = [r['dynamics'] for r in all_results[band_name].values() 
-               if r is not None and r['dynamics'] is not None]
+            return None, None
+        dfs = [r[source] for r in all_results[band_name].values() 
+               if r is not None and r[source] is not None]
         if not dfs:
-            continue
+            return None, None
         combined = pd.concat(dfs)
-        grouped = combined.groupby('tau_embed')['Storage'].mean().reset_index()
+        grouped = combined.groupby('tau_embed')[metric].mean().reset_index()
         time_ms = grouped['tau_embed'] / fs * 1000
-        ax_storage.plot(time_ms, grouped['Storage'], 'o-', color=BAND_COLORS[band_name],
-                       label=band_name.upper(), linewidth=2)
+        return time_ms, grouped[metric]
+    
+    # Panel A: Storage (narrowband only, to show structure)
+    ax_storage = fig.add_subplot(gs[0, 0])
+    for band_name in narrowband_order:
+        time_ms, values = get_band_data(band_name, 'Storage')
+        if time_ms is not None:
+            ax_storage.plot(time_ms, values, 'o-', color=BAND_COLORS[band_name],
+                           label=band_name.upper(), linewidth=2)
     ax_storage.set_xlabel('τ (ms)')
     ax_storage.set_ylabel('Storage (bits)')
-    ax_storage.set_title('A) Information Storage')
+    ax_storage.set_title('A) Storage - Narrowband')
     ax_storage.legend(fontsize=8)
     ax_storage.grid(alpha=0.3)
     ax_storage.set_xscale('log')
     
-    # Panel B: Transfer across bands
-    ax_transfer = fig.add_subplot(gs[0, 1])
+    # Panel B: Broadband zoomed (own scale!)
+    ax_broadband = fig.add_subplot(gs[0, 1])
+    bb_metrics = ['Storage', 'Transfer', 'Copy']
+    bb_colors = ['#1f77b4', '#2ca02c', '#d62728']
+    for metric, color in zip(bb_metrics, bb_colors):
+        time_ms, values = get_band_data('broadband', metric)
+        if time_ms is not None:
+            ax_broadband.plot(time_ms, values, 'o-', color=color, label=metric, linewidth=2, markersize=6)
+    ax_broadband.set_xlabel('τ (ms)')
+    ax_broadband.set_ylabel('bits')
+    ax_broadband.set_title('B) BROADBAND (zoomed scale) - LRTC Structure')
+    ax_broadband.legend(fontsize=8)
+    ax_broadband.grid(alpha=0.3)
+    ax_broadband.set_xscale('log')
+    # Note: y-axis auto-scales to show broadband's small but meaningful values!
+    
+    # Panel C: Normalized Storage (all bands, each normalized by its max)
+    ax_normalized = fig.add_subplot(gs[0, 2])
     for band_name in band_order:
-        if band_name not in all_results or all_results[band_name] is None:
-            continue
-        dfs = [r['dynamics'] for r in all_results[band_name].values() 
-               if r is not None and r['dynamics'] is not None]
-        if not dfs:
-            continue
-        combined = pd.concat(dfs)
-        grouped = combined.groupby('tau_embed')['Transfer'].mean().reset_index()
-        time_ms = grouped['tau_embed'] / fs * 1000
-        ax_transfer.plot(time_ms, grouped['Transfer'], 'o-', color=BAND_COLORS[band_name],
-                        label=band_name.upper(), linewidth=2)
+        time_ms, values = get_band_data(band_name, 'Storage')
+        if time_ms is not None and len(values) > 0:
+            max_val = values.abs().max()
+            if max_val > 0:
+                normalized = values / max_val
+                ax_normalized.plot(time_ms, normalized, 'o-', color=BAND_COLORS[band_name],
+                                  label=band_name.upper(), linewidth=2)
+    ax_normalized.set_xlabel('τ (ms)')
+    ax_normalized.set_ylabel('Normalized Storage (max=1)')
+    ax_normalized.set_title('C) Storage Normalized - All Bands Comparable')
+    ax_normalized.legend(fontsize=8)
+    ax_normalized.grid(alpha=0.3)
+    ax_normalized.set_xscale('log')
+    ax_normalized.set_ylim(-0.1, 1.1)
+    
+    # Panel D: Transfer across bands (narrowband)
+    ax_transfer = fig.add_subplot(gs[1, 0])
+    for band_name in narrowband_order:
+        time_ms, values = get_band_data(band_name, 'Transfer')
+        if time_ms is not None:
+            ax_transfer.plot(time_ms, values, 'o-', color=BAND_COLORS[band_name],
+                            label=band_name.upper(), linewidth=2)
     ax_transfer.set_xlabel('τ (ms)')
     ax_transfer.set_ylabel('Transfer (bits)')
-    ax_transfer.set_title('B) Information Transfer')
+    ax_transfer.set_title('D) Transfer - Narrowband')
     ax_transfer.legend(fontsize=8)
     ax_transfer.grid(alpha=0.3)
     ax_transfer.set_xscale('log')
     
-    # Panel C: Integrated Info
-    ax_phi = fig.add_subplot(gs[0, 2])
-    for band_name in band_order:
-        if band_name not in all_results or all_results[band_name] is None:
-            continue
-        dfs = [r['iit'] for r in all_results[band_name].values() 
-               if r is not None and r['iit'] is not None]
-        if not dfs:
-            continue
-        combined = pd.concat(dfs)
-        grouped = combined.groupby('tau_embed')['Integrated_info'].mean().reset_index()
-        time_ms = grouped['tau_embed'] / fs * 1000
-        ax_phi.plot(time_ms, grouped['Integrated_info'], 'o-', color=BAND_COLORS[band_name],
-                   label=band_name.upper(), linewidth=2)
+    # Panel E: Integrated Info
+    ax_phi = fig.add_subplot(gs[1, 1])
+    for band_name in narrowband_order:
+        time_ms, values = get_band_data(band_name, 'Integrated_info', source='iit')
+        if time_ms is not None:
+            ax_phi.plot(time_ms, values, 'o-', color=BAND_COLORS[band_name],
+                       label=band_name.upper(), linewidth=2)
     ax_phi.set_xlabel('τ (ms)')
     ax_phi.set_ylabel('Φ (bits)')
-    ax_phi.set_title('C) Integrated Information')
+    ax_phi.set_title('E) Integrated Information')
     ax_phi.legend(fontsize=8)
     ax_phi.grid(alpha=0.3)
     ax_phi.set_xscale('log')
     
-    # Panel D: Downward vs Upward causation for alpha
-    ax_causation = fig.add_subplot(gs[1, 0])
+    # Panel F: Downward vs Upward causation for alpha
+    ax_causation = fig.add_subplot(gs[1, 2])
     if 'alpha' in all_results and all_results['alpha'] is not None:
         dfs = [r['dynamics'] for r in all_results['alpha'].values() 
                if r is not None and r['dynamics'] is not None]
@@ -596,8 +867,8 @@ def plot_grand_summary_phiid(all_results, fs, save_path=None):
     ax_causation.grid(alpha=0.3)
     ax_causation.set_xscale('log')
     
-    # Panel E: Bars by band
-    ax_bars = fig.add_subplot(gs[1, 1])
+    # Panel G: Bars by band
+    ax_bars = fig.add_subplot(gs[2, 0])
     
     bar_data = []
     for band_name in band_order:
@@ -630,33 +901,49 @@ def plot_grand_summary_phiid(all_results, fs, save_path=None):
         ax_bars.legend()
         ax_bars.grid(axis='y', alpha=0.3)
     
-    # Panel F: Interpretation
-    ax_interp = fig.add_subplot(gs[1, 2])
+    # Panel H: Broadband vs Alpha at large τ
+    ax_compare = fig.add_subplot(gs[2, 1])
+    for band_name in ['broadband', 'alpha']:
+        time_ms, storage = get_band_data(band_name, 'Storage')
+        if time_ms is not None:
+            # Focus on large τ where LRTC matters
+            mask = time_ms >= 100  # Only τ >= 100ms
+            ax_compare.plot(time_ms[mask], storage[mask], 'o-', 
+                           color=BAND_COLORS[band_name],
+                           label=f'{band_name.upper()} Storage', linewidth=2, markersize=6)
+    ax_compare.set_xlabel('τ (ms)')
+    ax_compare.set_ylabel('Storage (bits)')
+    ax_compare.set_title('H) Large-τ Storage: Broadband vs Alpha')
+    ax_compare.legend(fontsize=8)
+    ax_compare.grid(alpha=0.3)
+    ax_compare.set_xscale('log')
+    
+    # Panel I: Interpretation
+    ax_interp = fig.add_subplot(gs[2, 2])
     ax_interp.axis('off')
     
     interpretation = """
     PhiID TEMPORAL ANALYSIS
     =======================
     
-    WHAT WE'RE MEASURING:
-    • Temporal PhiID: How info flows between
-      a signal and its time-shifted self
+    WHY BROADBAND LOOKS SMALL:
+    • Narrowband: 0.1-1.8 bits
+    • Broadband: 0.001-0.01 bits
+    → 100x difference in scale!
     
-    KEY METRICS:
-    • Storage: Info preserved over time
-    • Transfer: Info flowing forward in time  
-    • Copy: Redundant temporal structure
-    • Causation: Direction of info flow
+    IMPORTANT:
+    • Panel B shows broadband on its OWN scale
+    • Panel C normalizes all bands (max=1)
+    
+    BROADBAND STRUCTURE (LRTC):
+    • Non-zero at large τ (seconds)
+    • Reflects 1/f long-range correlations
+    • Narrowband decorrelates quickly
     
     INTERPRETATION:
     • High Storage: Persistent dynamics
     • High Transfer: Active processing
     • High Φ: Integrated temporal structure
-    
-    BAND SIGNATURES:
-    • Delta: High storage (slow persistence)
-    • Alpha: Periodic transfer patterns
-    • Gamma: Rapid transfer, low storage
     """
     
     ax_interp.text(0.05, 0.95, interpretation, transform=ax_interp.transAxes,
@@ -706,9 +993,9 @@ def main():
     ACF_FILTER_STRATEGY = 'threshold'  # 'threshold', 'relaxed', or 'all'
     
     # Takens embedding delays (τ values) - uniform spacing: t, t+τ, t+2τ, t+3τ
-    # Extended to probe SLOW dynamics (attention, cognitive states, etc.)
+    # Extended to probe SLOW dynamics (attention, cognitive states, LRTC, etc.)
     # With 50000 samples at 300Hz = 166.7 seconds, max τ could be ~40 seconds (12000 samples)
-    # But practical limit: need enough windows for statistics
+    # But practical limit: need enough samples for statistics (at least 10x embedding span)
     TIMESCALES_MS = [
         # Fast dynamics (gamma/beta)
         10, 20, 30, 50, 75, 100,
@@ -716,22 +1003,21 @@ def main():
         150, 200, 300, 500, 750, 1000,
         # Slow dynamics (delta, attention, cognitive states)
         1500, 2000, 3000, 5000,
-        # Very slow dynamics (if signal is long enough)
-        # 7500, 10000
+        # Very slow dynamics / LRTC (requires long recordings!)
+        7500, 10000, 15000, 20000,  # 7.5s, 10s, 15s, 20s
     ]
     ALL_TAU_VALUES = create_lag_schedule(fs, TIMESCALES_MS)
     
     # Verify signal length is sufficient for largest τ
-    # Takens needs 3τ samples, plus some buffer
+    # Takens needs 3τ samples, plus buffer for statistical reliability
     max_tau = max(ALL_TAU_VALUES)
-    min_samples_needed = 4 * max_tau  # 3τ for embedding + 1τ buffer
+    min_samples_needed = 10 * max_tau  # Need ~10x embedding span for reliable estimates
     if SUBSAMPLE < min_samples_needed:
-        print(f"  Warning: SUBSAMPLE ({SUBSAMPLE}) may be too small for max τ={max_tau}")
-        print(f"           Need at least {min_samples_needed} samples")
-        # Reduce τ range
-        safe_max_tau = SUBSAMPLE // 4
+        print(f"  Note: SUBSAMPLE ({SUBSAMPLE}) limits max τ for reliable statistics")
+        # Reduce τ range to what's statistically reliable
+        safe_max_tau = SUBSAMPLE // 10
         ALL_TAU_VALUES = [t for t in ALL_TAU_VALUES if t <= safe_max_tau]
-        print(f"           Limiting τ to max {safe_max_tau} samples ({safe_max_tau/fs*1000:.0f}ms)")
+        print(f"        Limiting τ to max {safe_max_tau} samples ({safe_max_tau/fs*1000:.0f}ms = {safe_max_tau/fs:.1f}s)")
     
     # Select key channels for analysis
     KEY_CHANNELS = ['eeg-Fz', 'eeg-Cz', 'eeg-O1', 'eeg-T3']
@@ -765,7 +1051,10 @@ def main():
             signal = df[ch].values[:SUBSAMPLE]
             signal = signal[~np.isnan(signal)]
             if len(signal) > 1000:
-                filtered = bandpass_filter(signal, fmin, fmax, fs)
+                if band_name == 'broadband':
+                    filtered = highpass_filter(signal, fmin, fs)
+                else:
+                    filtered = bandpass_filter(signal, fmin, fmax, fs)
                 first_valid_signal = filtered
                 break
         
@@ -799,8 +1088,13 @@ def main():
             signal = signal[~np.isnan(signal)]
             
             try:
-                # Bandpass filter
-                filtered = bandpass_filter(signal, fmin, fmax, fs)
+                # Apply appropriate filter based on band type
+                if band_name == 'broadband':
+                    # For broadband: just highpass to remove DC drift, preserves LRTC!
+                    filtered = highpass_filter(signal, fmin, fs)
+                else:
+                    # Standard bandpass for narrowband oscillations
+                    filtered = bandpass_filter(signal, fmin, fmax, fs)
                 
                 # Analyze PhiID with Takens embedding (using band-specific τ values!)
                 df_atoms, df_dynamics, df_iit = analyze_channel_temporal_phiid(
@@ -901,20 +1195,24 @@ def main():
         plot_band_comparison_phiid(all_results, metric, fs,
                                    save_path=RESULTS_DIR / f"band_comparison_{metric.lower()}.png")
     
-    # 3. Individual channel plots for alpha
-    print("3. Alpha band channel details...")
-    if 'alpha' in all_results:
-        for ch, results in all_results['alpha'].items():
-            if results is None:
-                continue
-            ch_name = ch.replace('eeg-', '')
-            
-            plot_phiid_atoms_heatmap(results['atoms'], ch, fs,
-                                     save_path=RESULTS_DIR / f"atoms_{ch_name}_alpha.png")
-            plot_dynamics_summary(results['dynamics'], ch, fs,
-                                  save_path=RESULTS_DIR / f"dynamics_{ch_name}_alpha.png")
-            plot_iit_summary(results['iit'], ch, fs,
-                             save_path=RESULTS_DIR / f"iit_{ch_name}_alpha.png")
+    # 3. Master summary: all bands × key metrics (one big figure!)
+    print("3. Master summary (all bands × metrics)...")
+    plot_all_bands_summary(all_results, fs, save_path=RESULTS_DIR / "master_summary.png")
+    
+    # 4. Per-band consolidated plots (all channels in one figure per band)
+    print("4. Per-band consolidated plots...")
+    for band_name in ['broadband', 'delta', 'theta', 'alpha', 'beta', 'gamma']:
+        if band_name not in all_results or all_results[band_name] is None:
+            continue
+        print(f"   {band_name.upper()}...")
+        
+        # Dynamics: all channels, all metrics in one figure
+        plot_band_all_channels(all_results[band_name], band_name, fs,
+                              save_path=RESULTS_DIR / f"dynamics_{band_name}_all_channels.png")
+        
+        # Atoms heatmap: all channels side by side
+        plot_atoms_heatmap_all_channels(all_results[band_name], band_name, fs,
+                                        save_path=RESULTS_DIR / f"atoms_{band_name}_all_channels.png")
     
     # Summary
     print(f"\n{'='*70}")

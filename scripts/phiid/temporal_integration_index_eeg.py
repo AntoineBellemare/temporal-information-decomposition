@@ -64,6 +64,14 @@ DYNAMICS_GROUPS = {
     'Downward_causation': ['stx', 'sty', 'str'],
 }
 
+# IIT-inspired metric definitions (from Mediano et al. / goofi PhiID node)
+IIT_METRICS = {
+    'Information_storage': ['xtx', 'yty', 'rtr', 'sts'],
+    'Transfer_entropy': ['xty', 'xtr', 'str', 'sty'],
+    'Causal_density': ['xtr', 'ytr', 'sty', 'str', 'str', 'xty', 'ytx', 'stx'],
+    'Integrated_information': ['rts', 'xts', 'sts', 'sty', 'str', 'yts', 'ytx', 'stx', 'xty'],
+}
+
 
 def load_eeg_data(file_path, target_fs, max_duration):
     """Load and preprocess EEG data."""
@@ -278,6 +286,36 @@ def compute_dynamics_metrics(atom_series):
     return metrics
 
 
+def compute_iit_metrics(atom_series):
+    """
+    Compute the 4 IIT-inspired metrics from atoms.
+    
+    These metrics are inspired by Integrated Information Theory concepts:
+    - Information_storage: Total preserved information (xtx + yty + rtr + sts)
+    - Transfer_entropy: Information flow between variables (xty + xtr + str + sty)
+    - Causal_density: Complexity of causal interactions
+    - Integrated_information: ~Phi, synergistic integration minus redundancy
+    
+    Note: For Integrated_information, we sum the synergistic/transfer atoms
+    and subtract rtr (double redundancy) to get net integration.
+    """
+    n_windows = len(atom_series['rtr'])
+    metrics = {}
+    
+    for metric_name, atom_list in IIT_METRICS.items():
+        metric_values = np.zeros(n_windows)
+        for atom_name in atom_list:
+            metric_values += atom_series[atom_name]
+        
+        # Special case: Integrated information subtracts rtr
+        if metric_name == 'Integrated_information':
+            metric_values -= atom_series['rtr']
+        
+        metrics[metric_name] = metric_values
+    
+    return metrics
+
+
 def compute_normalized_divergence(metrics_by_tau, tau_values):
     """
     Compute divergence normalized by each tau's typical values.
@@ -296,7 +334,11 @@ def compute_normalized_divergence(metrics_by_tau, tau_values):
     """
     results = {}
     
-    for metric_name in DYNAMICS_GROUPS.keys():
+    # Get metric names from the first tau entry (works for both DYNAMICS_GROUPS and IIT_METRICS)
+    first_tau = tau_values[0]
+    metric_names = list(metrics_by_tau[first_tau].keys())
+    
+    for metric_name in metric_names:
         # Stack all tau timeseries
         raw_matrix = np.array([metrics_by_tau[tau][metric_name] for tau in tau_values])
         
@@ -335,14 +377,17 @@ def compute_normalized_divergence(metrics_by_tau, tau_values):
     return results
 
 
-def compute_cross_scale_prediction(results, tau_values, max_offset=10):
+def compute_cross_scale_prediction(results, tau_values, max_offset=10, metric_names=None):
     """Compute lagged correlation between shortest and longest tau timeseries."""
     cross_scale = {}
     
     short_tau = min(tau_values)
     long_tau = max(tau_values)
     
-    for metric_name in DYNAMICS_GROUPS.keys():
+    if metric_names is None:
+        metric_names = DYNAMICS_GROUPS.keys()
+    
+    for metric_name in metric_names:
         short_series = results[metric_name]['raw_by_tau'][short_tau]
         long_series = results[metric_name]['raw_by_tau'][long_tau]
         
@@ -383,14 +428,17 @@ def compute_cross_scale_prediction(results, tau_values, max_offset=10):
     return cross_scale
 
 
-def compute_granger_causality(results, tau_values, max_order=5):
+def compute_granger_causality(results, tau_values, max_order=5, metric_names=None):
     """Compute Granger causality between short and long tau dynamics."""
     granger_results = {}
     
     short_tau = min(tau_values)
     long_tau = max(tau_values)
     
-    for metric_name in DYNAMICS_GROUPS.keys():
+    if metric_names is None:
+        metric_names = DYNAMICS_GROUPS.keys()
+    
+    for metric_name in metric_names:
         short_series = results[metric_name]['raw_by_tau'][short_tau]
         long_series = results[metric_name]['raw_by_tau'][long_tau]
         
@@ -471,14 +519,17 @@ def compute_granger_causality(results, tau_values, max_order=5):
     return granger_results
 
 
-def compute_phase_coupling(results, tau_values, fs):
+def compute_phase_coupling(results, tau_values, fs, metric_names=None):
     """Compute phase locking between short and long tau dynamics."""
     phase_results = {}
     
     short_tau = min(tau_values)
     long_tau = max(tau_values)
     
-    for metric_name in DYNAMICS_GROUPS.keys():
+    if metric_names is None:
+        metric_names = DYNAMICS_GROUPS.keys()
+    
+    for metric_name in metric_names:
         short_series = results[metric_name]['raw_by_tau'][short_tau]
         long_series = results[metric_name]['raw_by_tau'][long_tau]
         
@@ -548,32 +599,48 @@ def analyze_channel(signal, fs, tau_values, window_samples, step_samples, n_surr
     # Real data
     print("    Computing real data with Takens embedding...")
     metrics_by_tau = {}
+    iit_metrics_by_tau = {}
     for tau in tau_values:
         atoms = compute_phiid_for_tau(signal, tau, window_samples, step_samples, n_windows)
         metrics_by_tau[tau] = compute_dynamics_metrics(atoms)
+        iit_metrics_by_tau[tau] = compute_iit_metrics(atoms)
     
     real_results = compute_normalized_divergence(metrics_by_tau, tau_values)
+    iit_results = compute_normalized_divergence(iit_metrics_by_tau, tau_values)
+    
+    # Dynamics metrics additional analysis
     cross_scale = compute_cross_scale_prediction(real_results, tau_values)
     granger = compute_granger_causality(real_results, tau_values)
     phase = compute_phase_coupling(real_results, tau_values, fs)
     
+    # IIT metrics additional analysis
+    iit_cross_scale = compute_cross_scale_prediction(iit_results, tau_values, metric_names=IIT_METRICS.keys())
+    iit_granger = compute_granger_causality(iit_results, tau_values, metric_names=IIT_METRICS.keys())
+    iit_phase = compute_phase_coupling(iit_results, tau_values, fs, metric_names=IIT_METRICS.keys())
+    
     # Surrogate data
     print(f"    Computing {n_surrogates} surrogates...")
     surrogate_divergences = {metric: [] for metric in DYNAMICS_GROUPS.keys()}
+    iit_surrogate_divergences = {metric: [] for metric in IIT_METRICS.keys()}
     
     for s in range(n_surrogates):
         surr_signal = create_surrogate(signal, method='phase_shuffle')
         surr_metrics_by_tau = {}
+        surr_iit_by_tau = {}
         for tau in tau_values:
             atoms = compute_phiid_for_tau(surr_signal, tau, window_samples, step_samples, n_windows)
             surr_metrics_by_tau[tau] = compute_dynamics_metrics(atoms)
+            surr_iit_by_tau[tau] = compute_iit_metrics(atoms)
         
         surr_results = compute_normalized_divergence(surr_metrics_by_tau, tau_values)
+        surr_iit_results = compute_normalized_divergence(surr_iit_by_tau, tau_values)
         
         for metric_name in DYNAMICS_GROUPS.keys():
             surrogate_divergences[metric_name].append(surr_results[metric_name]['normalized_divergence'])
+        for metric_name in IIT_METRICS.keys():
+            iit_surrogate_divergences[metric_name].append(surr_iit_results[metric_name]['normalized_divergence'])
     
-    # Add surrogate stats
+    # Add surrogate stats for dynamics metrics
     for metric_name in DYNAMICS_GROUPS.keys():
         surr_divs = np.array(surrogate_divergences[metric_name])
         surr_mean = np.mean(surr_divs, axis=0)
@@ -589,13 +656,42 @@ def analyze_channel(signal, fs, tau_values, window_samples, step_samples, n_surr
         real_results[metric_name]['significant_integration'] = zscore_div < -2
         real_results[metric_name]['significant_fragmentation'] = zscore_div > 2
     
-    return real_results, cross_scale, granger, phase, n_windows
-
-
-def plot_analysis(results, cross_scale, granger, phase, time_sec, tau_values, fs, channel, save_dir):
-    """Create visualization for analysis results."""
+    # Add surrogate stats for IIT metrics
+    for metric_name in IIT_METRICS.keys():
+        surr_divs = np.array(iit_surrogate_divergences[metric_name])
+        surr_mean = np.mean(surr_divs, axis=0)
+        surr_std = np.std(surr_divs, axis=0)
+        surr_std = np.maximum(surr_std, 0.001)
+        
+        real_div = iit_results[metric_name]['normalized_divergence']
+        zscore_div = (real_div - surr_mean) / surr_std
+        
+        iit_results[metric_name]['surrogate_mean'] = surr_mean
+        iit_results[metric_name]['surrogate_std'] = surr_std
+        iit_results[metric_name]['divergence_zscore'] = zscore_div
+        iit_results[metric_name]['significant_integration'] = zscore_div < -2
+        iit_results[metric_name]['significant_fragmentation'] = zscore_div > 2
     
-    for metric_name in DYNAMICS_GROUPS.keys():
+    return (real_results, iit_results, cross_scale, granger, phase, 
+            iit_cross_scale, iit_granger, iit_phase, n_windows)
+
+
+def plot_analysis(results, cross_scale, granger, phase, time_sec, tau_values, fs, channel, save_dir,
+                  metric_groups=None, prefix=''):
+    """
+    Create visualization for analysis results.
+    
+    Parameters
+    ----------
+    metric_groups : dict, optional
+        Dictionary of metric names to atom lists. Defaults to DYNAMICS_GROUPS.
+    prefix : str, optional
+        Prefix for output filenames (e.g., 'iit_' for IIT metrics)
+    """
+    if metric_groups is None:
+        metric_groups = DYNAMICS_GROUPS
+    
+    for metric_name in metric_groups.keys():
         m = results[metric_name]
         pred = cross_scale[metric_name]
         gc = granger[metric_name]
@@ -797,15 +893,15 @@ SURROGATE COMPARISON
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout()
-        plt.savefig(save_dir / f"takens_{metric_name}_{channel}.png", 
+        plt.savefig(save_dir / f"{prefix}takens_{metric_name}_{channel}.png", 
                    dpi=150, bbox_inches='tight')
         plt.close()
     
     # Summary figure for all metrics
-    n_metrics = len(DYNAMICS_GROUPS)
+    n_metrics = len(metric_groups)
     fig, axes = plt.subplots(2, n_metrics, figsize=(4*n_metrics, 8))
     
-    for col, metric_name in enumerate(DYNAMICS_GROUPS.keys()):
+    for col, metric_name in enumerate(metric_groups.keys()):
         m = results[metric_name]
         
         # Row 1: TII timeseries
@@ -826,9 +922,9 @@ SURROGATE COMPARISON
         ax.set_ylabel('Count')
         ax.grid(alpha=0.3)
     
-    plt.suptitle(f'All Metrics Comparison (Takens v3): {channel}', fontsize=14, fontweight='bold')
+    plt.suptitle(f'{prefix.upper().replace("_", " ")}Metrics Comparison (Takens v3): {channel}', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_dir / f"takens_all_metrics_{channel}.png", dpi=150, bbox_inches='tight')
+    plt.savefig(save_dir / f"{prefix}takens_all_metrics_{channel}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -883,6 +979,99 @@ def plot_mean_vs_divergence(results, tau_values, save_dir, channel='all'):
                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_dir / f"mean_vs_divergence_{channel}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_iit_metrics(iit_results, time_sec, tau_values, channel, save_dir):
+    """
+    Create visualization for IIT-inspired metrics.
+    
+    IIT Metrics:
+    - Information_storage: Total preserved information
+    - Transfer_entropy: Information flow between variables  
+    - Causal_density: Complexity of causal interactions
+    - Integrated_information: ~Phi, synergistic integration minus redundancy
+    """
+    n_metrics = len(IIT_METRICS)
+    fig, axes = plt.subplots(3, n_metrics, figsize=(5*n_metrics, 12))
+    
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6']  # Red, Blue, Green, Purple
+    
+    for col, (metric_name, color) in enumerate(zip(IIT_METRICS.keys(), colors)):
+        m = iit_results[metric_name]
+        
+        # Row 1: TII timeseries with significant periods
+        ax = axes[0, col]
+        ax.plot(time_sec, m['tii'], linewidth=1, color=color, label='TII')
+        ax.fill_between(time_sec, 0, 1, where=m['significant_integration'],
+                       alpha=0.3, color='green', label='Integrated')
+        ax.fill_between(time_sec, 0, 1, where=m['significant_fragmentation'],
+                       alpha=0.3, color='red', label='Fragmented')
+        ax.set_ylabel('TII')
+        ax.set_title(metric_name.replace('_', ' '), fontsize=11, fontweight='bold')
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        if col == 0:
+            ax.legend(loc='upper right', fontsize=7)
+        
+        # Row 2: TII Distribution
+        ax = axes[1, col]
+        ax.hist(m['tii'], bins=30, edgecolor='black', alpha=0.7, color=color)
+        mean_tii = np.mean(m['tii'])
+        ax.axvline(mean_tii, color='black', linestyle='--', linewidth=2)
+        ax.set_xlabel('TII')
+        ax.set_ylabel('Count')
+        ax.text(0.95, 0.95, f'μ={mean_tii:.3f}', transform=ax.transAxes,
+               fontsize=10, ha='right', va='top',
+               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        ax.grid(alpha=0.3)
+        
+        # Row 3: Raw values across tau (mean timeseries per tau)
+        ax = axes[2, col]
+        for i, tau in enumerate(tau_values):
+            alpha = 0.4 + 0.6 * (i / len(tau_values))
+            ax.plot(time_sec, m['raw_by_tau'][tau], alpha=alpha, linewidth=0.8,
+                   label=f'τ={tau}')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('bits')
+        ax.set_title(f'Raw values by τ')
+        if col == n_metrics - 1:
+            ax.legend(loc='upper right', fontsize=7, ncol=2)
+        ax.grid(alpha=0.3)
+    
+    plt.suptitle(f'IIT Metrics (Takens v3): {channel}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_dir / f"iit_metrics_{channel}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Summary bar chart comparing IIT metrics
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    metric_names = list(IIT_METRICS.keys())
+    mean_tiis = [np.mean(iit_results[m]['tii']) for m in metric_names]
+    pct_integrated = [100 * np.mean(iit_results[m]['significant_integration']) for m in metric_names]
+    
+    x = np.arange(len(metric_names))
+    width = 0.35
+    
+    bars1 = ax.bar(x - width/2, mean_tiis, width, label='Mean TII', color='steelblue')
+    ax2 = ax.twinx()
+    bars2 = ax2.bar(x + width/2, pct_integrated, width, label='% Significant', color='coral', alpha=0.7)
+    
+    ax.set_xlabel('IIT Metric')
+    ax.set_ylabel('Mean TII', color='steelblue')
+    ax2.set_ylabel('% Significantly Integrated', color='coral')
+    ax.set_xticks(x)
+    ax.set_xticklabels([m.replace('_', '\n') for m in metric_names], fontsize=9)
+    ax.set_ylim(0, 1)
+    ax2.set_ylim(0, 100)
+    
+    ax.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    
+    plt.title(f'IIT Metrics Summary: {channel}', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_dir / f"iit_summary_{channel}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -1114,7 +1303,8 @@ def main():
         print(f"  Estimated optimal τ: {tau_opt} samples ({tau_opt/FS*1000:.1f}ms)")
         
         # Run analysis
-        results, cross_scale, granger, phase, n_windows = analyze_channel(
+        (results, iit_results, cross_scale, granger, phase, 
+         iit_cross_scale, iit_granger, iit_phase, n_windows) = analyze_channel(
             signal, FS, TAU_VALUES, WINDOW_SAMPLES, STEP_SAMPLES, N_SURROGATES
         )
         
@@ -1125,6 +1315,18 @@ def main():
         plot_analysis(
             results, cross_scale, granger, phase, 
             time_sec, TAU_VALUES, FS, channel, RESULTS_DIR
+        )
+        
+        # IIT metrics plot
+        print("  Generating IIT metrics plot...")
+        plot_iit_metrics(iit_results, time_sec, TAU_VALUES, channel, RESULTS_DIR)
+        
+        # IIT detailed analysis plots (12-panel for each IIT metric)
+        print("  Generating IIT detailed analysis plots...")
+        plot_analysis(
+            iit_results, iit_cross_scale, iit_granger, iit_phase,
+            time_sec, TAU_VALUES, FS, channel, RESULTS_DIR,
+            metric_groups=IIT_METRICS, prefix='iit_'
         )
         
         # Mean vs Divergence plot
@@ -1145,6 +1347,17 @@ def main():
             summary[f'{metric_name}_mean_coupling'] = m['mean_cross_tau_corr']
             summary[f'{metric_name}_granger_dir'] = gc['direction']
             summary[f'{metric_name}_plv'] = pc['plv']
+        
+        # Add IIT metrics to summary
+        for metric_name in IIT_METRICS.keys():
+            m = iit_results[metric_name]
+            gc = iit_granger[metric_name]
+            pc = iit_phase[metric_name]
+            summary[f'IIT_{metric_name}_mean_tii'] = np.mean(m['tii'])
+            summary[f'IIT_{metric_name}_pct_integrated'] = 100 * np.mean(m['significant_integration'])
+            summary[f'IIT_{metric_name}_mean_coupling'] = m['mean_cross_tau_corr']
+            summary[f'IIT_{metric_name}_granger_dir'] = gc['direction']
+            summary[f'IIT_{metric_name}_plv'] = pc['plv']
         
         all_summaries.append(summary)
     

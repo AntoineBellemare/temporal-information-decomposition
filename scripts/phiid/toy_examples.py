@@ -73,6 +73,9 @@ PROJECT_DIR = SCRIPT_DIR.parent.parent
 RESULTS_DIR = PROJECT_DIR / "results" / "phiid" / "toy_systems_v3"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Plot quality - use 300 DPI for publication-quality large figures
+FIGURE_DPI = 300
+
 # PhiID atom names (16 atoms in 4x4 grid)
 ATOM_NAMES = ['rtr', 'rtx', 'rty', 'rts',   # Redundancy source row
               'xtr', 'xtx', 'xty', 'xts',   # X-unique source row
@@ -558,7 +561,7 @@ def plot_theoretical_comparison(df: pd.DataFrame, save_path: Path):
     
     plt.suptitle('AR(1) Theoretical vs Actual PhiID', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -626,7 +629,7 @@ def plot_prediction_validation(df: pd.DataFrame, save_path: Path):
             fontfamily='monospace', verticalalignment='top')
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -642,16 +645,10 @@ def plot_atoms_grid(df: pd.DataFrame, title: str, save_path: Path):
     fig, axes = plt.subplots(4, 4, figsize=(18, 16))
     
     processes = df['process'].unique()
-    categories = df.set_index('process')['category'].to_dict()
     
-    # Color by category
-    category_colors = {
-        'baseline': '#888888',
-        'memory': '#1f77b4',
-        'synergistic': '#d62728',
-        'oscillatory': '#2ca02c',
-        'nonlinear': '#9467bd'
-    }
+    # Use a colormap to assign unique colors to each process
+    cmap = plt.cm.get_cmap('tab10') if len(processes) <= 10 else plt.cm.get_cmap('tab20')
+    process_colors = {proc: cmap(i % cmap.N) for i, proc in enumerate(processes)}
     
     for idx, atom in enumerate(ATOM_NAMES):
         row, col = idx // 4, idx % 4
@@ -659,8 +656,7 @@ def plot_atoms_grid(df: pd.DataFrame, title: str, save_path: Path):
         
         for proc in processes:
             df_proc = df[df['process'] == proc]
-            cat = categories.get(proc, 'baseline')
-            color = category_colors.get(cat, '#333333')
+            color = process_colors[proc]
             ax.plot(df_proc['tau_embed'], df_proc[atom], 'o-',
                    color=color, label=proc, linewidth=1.5, markersize=4, alpha=0.8)
         
@@ -676,7 +672,7 @@ def plot_atoms_grid(df: pd.DataFrame, title: str, save_path: Path):
     
     plt.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -699,24 +695,19 @@ def plot_dynamics_summary(df: pd.DataFrame, title: str, save_path: Path):
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
     axes = axes.flatten()
     
-    category_colors = {
-        'baseline': '#888888',
-        'memory': '#1f77b4',
-        'synergistic': '#d62728',
-        'oscillatory': '#2ca02c',
-        'nonlinear': '#9467bd'
-    }
-    
     metrics = list(DYNAMICS_GROUPS.keys())
     processes = df_dyn['process'].unique()
+    
+    # Use a colormap to assign unique colors to each process
+    cmap = plt.cm.get_cmap('tab10') if len(processes) <= 10 else plt.cm.get_cmap('tab20')
+    process_colors = {proc: cmap(i % cmap.N) for i, proc in enumerate(processes)}
     
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
         
         for proc in processes:
             df_proc = df_dyn[df_dyn['process'] == proc]
-            cat = df_proc['category'].iloc[0]
-            color = category_colors.get(cat, '#333333')
+            color = process_colors[proc]
             ax.plot(df_proc['tau_embed'], df_proc[metric], 'o-',
                    color=color, label=proc, linewidth=2, markersize=5, alpha=0.8)
         
@@ -731,7 +722,7 @@ def plot_dynamics_summary(df: pd.DataFrame, title: str, save_path: Path):
     
     plt.suptitle(title, fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -779,7 +770,7 @@ def plot_category_comparison(df: pd.DataFrame, save_path: Path):
     
     plt.suptitle('Category Comparison: Key PhiID Atoms', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -810,7 +801,7 @@ def plot_heatmap_at_tau(df: pd.DataFrame, tau_value: int, save_path: Path):
     ax.set_ylabel('Process', fontsize=11)
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -861,7 +852,7 @@ def plot_synergy_vs_redundancy(df: pd.DataFrame, save_path: Path):
     ax.plot(lims, lims, 'k--', alpha=0.3, label='Equal')
     
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -920,7 +911,7 @@ def plot_tau_decay_profiles(df: pd.DataFrame, save_path: Path):
     
     plt.suptitle('Temporal Decay Profiles (Normalized)', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path.name}")
 
@@ -1108,7 +1099,7 @@ def create_interpretation_guide(save_path: Path):
         ax6.text(x + 0.06, y + 0.07, f'{cat_name}: {desc}', transform=ax6.transAxes,
                 fontsize=10, verticalalignment='center')
     
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(save_path, dpi=FIGURE_DPI, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  Saved: {save_path.name}")
 

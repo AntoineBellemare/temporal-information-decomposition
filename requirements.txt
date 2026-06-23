@@ -7,7 +7,7 @@ seaborn>=0.11.0
 
 # Information theory
 dit>=1.5.0
-phyid>=0.1.0
+phyid @ git+https://github.com/Imperial-MIND-lab/integrated-info-decomp.git
 
 # Machine learning (for clustering, preprocessing)
 scikit-learn>=1.0.0

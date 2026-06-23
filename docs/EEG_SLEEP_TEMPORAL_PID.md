@@ -93,7 +93,17 @@ Heatmap with x = time, y = lag difference (lag₂ − lag₁), colour = metric. 
 
 **File:** `global_pid_vs_ar1.png`
 
-3 × 4 grid of lag₁ × lag₂ heatmaps: top row = actual PID, middle row = AR(1) baseline, bottom row = excess (actual − AR(1)). Each column is one atom. The excess row uses a diverging colourmap centred at zero. Shows whether the observed PID structure exceeds what a simple linear autoregressive process would produce.
+3 × 4 grid of lag₁ × lag₂ heatmaps: top row = actual PID, middle row = AR(1) baseline (averaged across the per-stage fits), bottom row = excess (actual − AR(1)). Each column is one atom. The excess row uses a diverging colourmap centred at zero. Shows whether the observed PID structure exceeds what a linear-Gaussian baseline matched to the data's marginal autocorrelation would produce. For stage-resolved excess, see Plot 7b.
+
+---
+
+### Plot 7b — Per-stage PID Excess vs Stage-Conditional AR(1)
+
+**File:** `global_pid_vs_ar1_per_stage.png`
+
+Grid with one row per sleep stage and four columns (redundancy, synergy, unique₁, unique₂). Each cell is the lag₁ × lag₂ excess matrix (Actual − stage-matched AR(1)) for that stage and that atom, with a diverging colourmap centred at zero and a per-atom shared vmax across stages so colours are comparable.
+
+A final row carries the **double-dissociation strip**: one bar plot per atom showing Cohen's *d* of the per-window excess for every stage pair. Stage pairs whose *d* vector has opposite signs across atoms (e.g., *d* > 0 for redundancy but *d* < 0 for synergy) are highlighted in red and listed in the suptitle. This is the quantitative version of the "double dissociation" Pedro flagged in Fig 7: it answers *where* in stage space the dissociation lives and which atom contrast carries it.
 
 ---
 
@@ -169,20 +179,32 @@ Four heatmaps (redundancy, synergy, total unique, S/R ratio) showing Cohen's d b
 
 ---
 
-## Configuration
+## Configuration (current pass — short windows)
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `WINDOW_SEC` | 15 | Window duration in seconds |
-| `MAX_LAG_MIN` | 10 | Maximum lag in minutes |
-| `N_BINS` | 4 | Number of quantile bins |
+| `WINDOW_SEC` | 1 | Window duration in seconds — addresses Pedro's point that 30-s blocks are too long for EEG |
+| `MAX_LAG_MIN` | 0.5 | Maximum lag in minutes (= 30 s) |
+| `N_BINS` | 4 | Number of quantile bins (reduced from 6 because each 1-s window has only `fs·Δt` samples for the joint distribution) |
 | `DISCRETIZE_PER_WINDOW` | True | Per-window quantile binning |
-| `CONTINUOUS_STAGE_FILTER` | False | If True, all windows between source₂ and target must share the same stage |
+| `CONTINUOUS_STAGE_FILTER` | True | At Δt = 1 s, triplets can span a 30-s lag — requiring every interior window to share the stage prevents straddling boundaries |
+| `BANDS` | None | Broadband first pass; band-resolved pass to follow |
+| `DURATION_HOURS` | 3.5 | Captures ~2 full NREM–REM cycles on Bitbrain ds005555 sub-1 — enough N3, ≥1 REM bout |
+| `TARGET_STEP` | 3 | Stride for the time-resolved PID target axis (every 3 s). The window itself is still 1 s; only the *time-density* of estimates is thinned. Global PID, AR(1), block-perm null are unaffected. |
 
-## Script
+### AR(1) baseline — stage-conditional
+
+φ and σ are fit per sleep stage on that stage's windows only; an AR(1) PID matrix is generated per stage and matched to each target window at broadcast time. This isolates excess (Actual − AR(1)) *within* a stage from across-stage spectral differences, and is what underwrites the new per-stage excess figure.
+
+### Block-permutation null
+
+At Δt = 1 s, the block-permutation null shuffles **1-second blocks**, which actually destroys most of the linear autocorrelation of interest — directly responding to Pedro's concern that 30-s block shuffles preserved too much structure to be informative.
+
+## Scripts
 
 ```
-python scripts/pid/eeg_sleep.py
+python scripts/pid/eeg_sleep_compute.py        # all 6 channels, broadband
+python scripts/pid/eeg_sleep_plot.py           # all figures, including Plot 7b
 ```
 
-Results are saved to `results/pid/eeg_sleep/`.
+Results are saved to `results/pid/eeg_sleep/<channel>/`.

@@ -26,6 +26,14 @@ import argparse
 import hashlib
 import json
 
+# Force UTF-8 on stdout/stderr — Windows consoles default to cp1252 and crash
+# on stray Unicode glyphs (arrows, Greek, checkmarks).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 warnings.filterwarnings('ignore')
 
 from scipy.stats import kruskal, mannwhitneyu, spearmanr, wilcoxon, levene
@@ -83,9 +91,9 @@ def _apply_params(params):
     CONTINUOUS_STAGE_FILTER = params["CONTINUOUS_STAGE_FILTER"]
     DURATION_HOURS = params["DURATION_HOURS"]
     BANDS = params.get("BANDS", None)
-    WINDOWS_PER_MIN = 60 // WINDOW_SEC
-    MIN_PER_WINDOW = WINDOW_SEC / 60
-    MAX_LAG_WINDOWS = MAX_LAG_MIN * WINDOWS_PER_MIN
+    WINDOWS_PER_MIN = 60.0 / WINDOW_SEC
+    MIN_PER_WINDOW = WINDOW_SEC / 60.0
+    MAX_LAG_WINDOWS = int(round(MAX_LAG_MIN * WINDOWS_PER_MIN))
 
 
 # initialise with first available config (or defaults)
@@ -96,9 +104,9 @@ else:
     WINDOW_SEC = 30; MAX_LAG_MIN = 10; N_BINS = 4
     DISCRETIZE_PER_WINDOW = True; CONTINUOUS_STAGE_FILTER = False
     DURATION_HOURS = 4; BANDS = None
-    WINDOWS_PER_MIN = 60 // WINDOW_SEC
-    MIN_PER_WINDOW = WINDOW_SEC / 60
-    MAX_LAG_WINDOWS = MAX_LAG_MIN * WINDOWS_PER_MIN
+    WINDOWS_PER_MIN = 60.0 / WINDOW_SEC
+    MIN_PER_WINDOW = WINDOW_SEC / 60.0
+    MAX_LAG_WINDOWS = int(round(MAX_LAG_MIN * WINDOWS_PER_MIN))
 
 STAGE_COLORS = {
     'Wake': '#E8A317',
@@ -404,6 +412,154 @@ def plot_stage_comparison(tr, channel, save_path=None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
 
 
+def plot_pid_distribution_over_time(tr, stage_labels, channel, save_path=None):
+    """Plot 5 — percentile bands for each PID atom over time.
+
+    For each window, the cross-lag-pair spread is summarised as median + IQR
+    + 10–90th percentile, overlaid on stage shading. Shows variability of
+    temporal information across timescales within each window.
+    """
+    atoms = [('redundancy', 'Redundancy', '#2ca02c'),
+             ('synergy',    'Synergy',    '#d62728'),
+             ('unique_total', 'Total unique', '#1f77b4')]
+    tr = tr.copy()
+    tr['unique_total'] = tr['unique_0'] + tr['unique_1']
+    times = np.array(sorted(tr['time_min'].unique()))
+    pct = {}
+    for col, _, _ in atoms:
+        p10, p25, med, p75, p90 = [], [], [], [], []
+        for t in times:
+            v = tr.loc[tr['time_min'] == t, col].values
+            if len(v):
+                qs = np.nanpercentile(v, [10, 25, 50, 75, 90])
+            else:
+                qs = [np.nan] * 5
+            p10.append(qs[0]); p25.append(qs[1]); med.append(qs[2])
+            p75.append(qs[3]); p90.append(qs[4])
+        pct[col] = dict(p10=np.array(p10), p25=np.array(p25), med=np.array(med),
+                        p75=np.array(p75), p90=np.array(p90))
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+    for ax, (col, label, color) in zip(axes, atoms):
+        if stage_labels is not None:
+            add_stage_background(ax, stage_labels)
+        q = pct[col]
+        ax.fill_between(times, q['p10'], q['p90'], color=color, alpha=0.18,
+                        label='10–90%')
+        ax.fill_between(times, q['p25'], q['p75'], color=color, alpha=0.30,
+                        label='IQR')
+        ax.plot(times, q['med'], color=color, lw=1.2, label='median')
+        ax.set_ylabel(f'{label} (bits)')
+        ax.grid(alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+    axes[-1].set_xlabel('Time (min)')
+    plt.suptitle(f'PID Distribution Over Time — {channel}',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+
+
+def plot_timeseries_vs_ar1(tr, tr_ar1, stage_labels, channel, save_path=None):
+    """Plot 8 — actual vs AR(1) PID time series.
+
+    Top: hypnogram. Below: R, S, total U as actual line + AR(1) grey fill +
+    excess dashed line. Shows the temporal evolution of non-linear structure.
+    """
+    if stage_labels is None or tr_ar1 is None:
+        return
+
+    times = np.array(sorted(tr['time_min'].unique()))
+
+    def _agg(df, col):
+        if col == 'unique_total':
+            tmp = df.copy()
+            tmp['unique_total'] = tmp['unique_0'] + tmp['unique_1']
+            col = 'unique_total'
+            df = tmp
+        return df.groupby('time_min', as_index=False)[col].mean().set_index('time_min')
+
+    metrics = [('redundancy', 'Redundancy', '#2ca02c'),
+               ('synergy',    'Synergy',    '#d62728'),
+               ('unique_total', 'Total unique', '#1f77b4')]
+
+    fig, axes = plt.subplots(4, 1, figsize=(16, 11),
+                             gridspec_kw={'height_ratios': [0.5, 1, 1, 1]},
+                             sharex=True)
+
+    # Hypnogram
+    stage_to_y = {'Wake': 4, 'REM': 3, 'N1': 2, 'N2': 1, 'N3': 0, '?': -1}
+    sax = axes[0]
+    for i, stg in enumerate(stage_labels):
+        x0 = i * MIN_PER_WINDOW
+        x1 = (i + 1) * MIN_PER_WINDOW
+        y = stage_to_y.get(stg, -1)
+        sax.fill_between([x0, x1], y - 0.4, y + 0.4,
+                         color=STAGE_COLORS.get(stg, '#D3D3D3'), linewidth=0)
+    sax.set_yticks([0, 1, 2, 3, 4]); sax.set_yticklabels(['N3', 'N2', 'N1', 'REM', 'Wake'])
+    sax.set_ylim(-0.5, 4.5)
+    sax.set_title('Hypnogram', fontsize=10)
+
+    for ax, (col, label, color) in zip(axes[1:], metrics):
+        if stage_labels is not None:
+            add_stage_background(ax, stage_labels)
+        actual = _agg(tr,     col).reindex(times)[col].values
+        baseline = _agg(tr_ar1, col).reindex(times)[col].values
+        excess = actual - baseline
+        ax.fill_between(times, 0, baseline, color='lightgray', alpha=0.6,
+                        label='AR(1) baseline')
+        ax.plot(times, actual, color=color, lw=1.2, label='Actual')
+        ax.plot(times, excess, color='black', ls='--', lw=0.8, label='Excess')
+        ax.set_ylabel(f'{label} (bits)')
+        ax.grid(alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+    axes[-1].set_xlabel('Time (min)')
+    plt.suptitle(f'Time series: Actual vs AR(1) baseline — {channel}',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+
+
+def plot_timescale_decay(tr, channel, save_path=None):
+    """Plot 13 — mean atom vs lag-pair separation, per stage.
+
+    Three panels: R, S, S/R ratio. One line per stage with SEM bands.
+    Shows how fast information decays with increasing timescale gap.
+    """
+    tr = common_lag_range(tr).copy()
+    tr['lag_diff'] = tr['lag2_min'] - tr['lag1_min']
+    tr['sr_ratio'] = tr['synergy'] / (tr['redundancy'] + 1e-9)
+
+    stages_present = [s for s in STAGE_ORDER if s in tr['stage'].unique()]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
+    metrics = [('redundancy', 'Redundancy', 'bits'),
+               ('synergy',    'Synergy',    'bits'),
+               ('sr_ratio',   'S / R ratio', 'ratio')]
+
+    for ax, (col, label, ylab) in zip(axes, metrics):
+        for s in stages_present:
+            sub = tr[tr['stage'] == s]
+            agg = sub.groupby('lag_diff')[col].agg(['mean', 'sem']).reset_index()
+            ax.plot(agg['lag_diff'], agg['mean'], color=STAGE_COLORS[s],
+                    label=s, lw=1.5)
+            ax.fill_between(agg['lag_diff'],
+                            agg['mean'] - agg['sem'],
+                            agg['mean'] + agg['sem'],
+                            color=STAGE_COLORS[s], alpha=0.18)
+        ax.set_title(label, fontweight='bold')
+        ax.set_xlabel('Lag separation τ₂ − τ₁ (min)')
+        ax.set_ylabel(ylab)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    plt.suptitle(f'Timescale decay per stage — {channel}',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+
+
 def plot_lagdiff_heatmap(tr, stage_labels, channel, save_path=None):
     tr = tr.copy()
     tr['lag_diff'] = tr['lag2_min'] - tr['lag1_min']
@@ -423,6 +579,13 @@ def plot_lagdiff_heatmap(tr, stage_labels, channel, save_path=None):
 
 
 def plot_global_matrix_vs_ar1(actual, ar1_mean, channel, save_path=None):
+    # If the AR(1) baseline is stage-conditional, collapse it to a single matrix
+    # for this global figure by averaging across stages (weighted by stage count
+    # is not available here; an unweighted mean is the right summary for a
+    # per-lag-pair comparison map).
+    if 'stage' in ar1_mean.columns:
+        ar1_mean = (ar1_mean.groupby(['lag1_min', 'lag2_min'], as_index=False)
+                    [['redundancy', 'synergy', 'unique_0', 'unique_1']].mean())
     merged = actual.merge(ar1_mean, on=['lag1_min', 'lag2_min'], suffixes=('', '_ar1'), how='inner')
     ar1_df = merged[['lag1_min', 'lag2_min'] +
                     [f'{m}_ar1' for m in ['redundancy', 'synergy', 'unique_0', 'unique_1']]].copy()
@@ -462,6 +625,147 @@ def plot_global_matrix_vs_ar1(actual, ar1_mean, channel, save_path=None):
     plt.suptitle(f'Global PID: Actual vs AR(1) Baseline\n({channel}, {N_BINS} bins)',
                  fontsize=14, fontweight='bold')
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
+
+
+def plot_global_pid_vs_ar1_per_stage(tr, ar1_global_mean, channel, save_path=None):
+    """Per-stage Actual − AR(1) excess maps, one row per stage.
+
+    Reveals whether different sleep stages exceed their own AR(1) baseline in
+    different ways — Pedro's "double dissociation" question. Bottom panel
+    shows the across-atom Cohen-d profile per stage contrast and flags
+    contrasts where the d-vector has opposite signs across atoms (the
+    quantitative version of double dissociation).
+    """
+    if 'stage' not in ar1_global_mean.columns:
+        print("    AR(1) baseline is not stage-conditional — skipping per-stage plot")
+        return
+
+    atoms = ['redundancy', 'synergy', 'unique_0', 'unique_1']
+    labels_a = ['Redundancy', 'Synergy', 'Unique₁', 'Unique₂']
+    stages = [s for s in STAGE_ORDER
+              if s in tr['stage'].unique() and s in ar1_global_mean['stage'].unique()]
+    if not stages:
+        print("    No stages with both actual and AR(1) data — skipping")
+        return
+
+    # Mean actual matrix per stage (over windows of that stage)
+    actual_per_stage = {
+        s: tr[tr['stage'] == s].groupby(['lag1_min', 'lag2_min'], as_index=False)
+             [atoms].mean()
+        for s in stages
+    }
+    ar1_per_stage = {
+        s: ar1_global_mean[ar1_global_mean['stage'] == s].copy()
+        for s in stages
+    }
+    excess_per_stage = {}
+    for s in stages:
+        m = actual_per_stage[s].merge(ar1_per_stage[s],
+                                      on=['lag1_min', 'lag2_min'],
+                                      suffixes=('', '_ar1'), how='inner')
+        for a in atoms:
+            m[f'{a}_ex'] = m[a] - m[f'{a}_ar1']
+        excess_per_stage[s] = m
+
+    # Shared vmax per atom across stages so colours are comparable
+    vmax_by_atom = {}
+    for a in atoms:
+        vals = []
+        for s in stages:
+            vals.append(excess_per_stage[s][f'{a}_ex'].abs().values)
+        all_v = np.concatenate(vals) if vals else np.array([0.0])
+        vmax_by_atom[a] = max(np.nanpercentile(all_v, 98), 1e-9)
+
+    lag_vals, l_idx = lag_index(actual_per_stage[stages[0]])
+    n_lags = len(lag_vals)
+    tick_labels = lag_tick_labels(lag_vals)
+
+    n_stages = len(stages)
+    fig, axes = plt.subplots(n_stages + 1, 4,
+                             figsize=(18, 3.0 * n_stages + 3.5),
+                             gridspec_kw={'height_ratios': [1] * n_stages + [0.9]})
+    if n_stages == 1:
+        axes = np.atleast_2d(axes)
+    for ri, s in enumerate(stages):
+        df_e = excess_per_stage[s]
+        for ci, (a, lab) in enumerate(zip(atoms, labels_a)):
+            ax = axes[ri, ci]
+            mat = np.full((n_lags, n_lags), np.nan)
+            for _, r in df_e.iterrows():
+                i1 = l_idx.get(r['lag1_min']); i2 = l_idx.get(r['lag2_min'])
+                if i1 is not None and i2 is not None:
+                    mat[i1, i2] = r[f'{a}_ex']
+            v = vmax_by_atom[a]
+            sns.heatmap(mat, ax=ax, cmap='RdBu_r', mask=np.isnan(mat),
+                        center=0, vmin=-v, vmax=v,
+                        xticklabels=tick_labels, yticklabels=tick_labels,
+                        cbar_kws={'label': 'bits' if ci == 3 else ''})
+            if ri == 0:
+                ax.set_title(lab, fontweight='bold')
+            ax.set_ylabel(f'{s}\nLag 1 (min)' if ci == 0 else '')
+            ax.set_xlabel('Lag 2 (min)' if ri == n_stages - 1 else '')
+
+    # Cohen-d strip across the same-stage filtered tr (per-atom, per stage)
+    def _cohen_d(x, y):
+        x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+        x = x[~np.isnan(x)]; y = y[~np.isnan(y)]
+        if len(x) < 2 or len(y) < 2:
+            return np.nan
+        pooled = np.sqrt((np.var(x, ddof=1) + np.var(y, ddof=1)) / 2.0)
+        return (x.mean() - y.mean()) / pooled if pooled > 1e-12 else np.nan
+
+    # Use per-window mean atoms (averaging across lag pairs) for d
+    excess_long = []
+    for s in stages:
+        df_a = tr[tr['stage'] == s].groupby('window', as_index=False)[atoms].mean()
+        ar1_s = ar1_per_stage[s][atoms].mean()
+        for a in atoms:
+            df_a[f'{a}_ex'] = df_a[a] - ar1_s[a]
+        df_a['stage'] = s
+        excess_long.append(df_a)
+    excess_long = pd.concat(excess_long, ignore_index=True)
+
+    stage_pairs = [(a, b) for i, a in enumerate(stages) for b in stages[i+1:]]
+    d_rows = []
+    for sa, sb in stage_pairs:
+        for a in atoms:
+            d = _cohen_d(excess_long.loc[excess_long['stage'] == sa, f'{a}_ex'],
+                         excess_long.loc[excess_long['stage'] == sb, f'{a}_ex'])
+            d_rows.append(dict(pair=f'{sa} vs {sb}', atom=a, d=d))
+    d_df = pd.DataFrame(d_rows)
+    if not d_df.empty:
+        # double dissociation: same pair has opposite-sign d's for ≥2 atoms
+        diss_pairs = []
+        for p, g in d_df.groupby('pair'):
+            signs = np.sign(g['d'].fillna(0).values)
+            if (signs > 0).any() and (signs < 0).any():
+                diss_pairs.append(p)
+        for ci, a in enumerate(atoms):
+            ax = axes[n_stages, ci]
+            sub = d_df[d_df['atom'] == a]
+            colors = ['#d62728' if abs(d) > 0.5 else '#1f77b4' for d in sub['d'].values]
+            ax.barh(range(len(sub)), sub['d'].values, color=colors)
+            ax.axvline(0, color='gray', ls='--', lw=0.7)
+            ax.set_yticks(range(len(sub)))
+            ax.set_yticklabels(sub['pair'].values, fontsize=7)
+            ax.set_xlabel("Cohen's d (excess)")
+            ax.set_title(labels_a[ci] + ' — d per stage pair',
+                         fontweight='bold', fontsize=9)
+            for k, p in enumerate(sub['pair'].values):
+                if p in diss_pairs:
+                    ax.get_yticklabels()[k].set_color('#d62728')
+                    ax.get_yticklabels()[k].set_fontweight('bold')
+            ax.grid(axis='x', alpha=0.3)
+        diss_txt = ('Opposite-sign stage pairs (double dissociation): '
+                    + (', '.join(diss_pairs) if diss_pairs else 'none'))
+    else:
+        diss_txt = 'No d values computed.'
+
+    plt.suptitle(f'Per-stage PID excess vs stage-conditional AR(1) — {channel}\n{diss_txt}',
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight'); plt.close()
 
@@ -797,7 +1101,7 @@ def plot_block_permutation(global_results, null_vals, channel, save_path=None):
     n_lags = len(lag_vals)
     tick_labels = lag_tick_labels(lag_vals)
     # rebuild lag_pairs in window units to match null_vals ordering
-    max_lag_w = MAX_LAG_MIN * WINDOWS_PER_MIN
+    max_lag_w = int(round(MAX_LAG_MIN * WINDOWS_PER_MIN))
     lag_pairs_w = [(l1, l2) for l1 in range(1, max_lag_w) for l2 in range(l1 + 1, max_lag_w + 1)]
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     comps = ['redundancy', 'synergy', 'unique_0', 'unique_1']
@@ -929,17 +1233,15 @@ def plot_optimal_timescales(tr, channel, save_path=None):
 # =============================================================================
 
 def plot_stage_distribution_analysis(tr, channel, save_path=None):
-    """Analyse how the *spread* of each PID metric differs across stages.
+    """Within-stage variability of each PID atom — paper-ready 2-row layout.
 
-    For each stage we collect the per-window mean of each metric (one value per
-    window, averaged over lag pairs). We then compare:
-      Row 1 – violin plots of the metric values (absolute)
-      Row 2 – CV (coefficient of variation = std/mean) per stage, with bootstrap CI
-      Row 3 – per-lag-pair CV profile: how variable is each metric across windows at
-              each timescale?  (low CV = homogeneous across recordings)
+    Row 1: within-window CV per stage with bootstrap 95% CI and KW + pairwise
+           BH-FDR significance brackets.
+    Row 2: CV by timescale (mean lag), raw at alpha=0.25 plus rolling-mean
+           smoothed line at alpha=0.95.
 
-    Stats: Levene's test for equality of variances across stages (overall), plus
-    Kruskal–Wallis on per-window CV values.
+    (The earlier violin row was redundant with plot_stage_comparison /
+    plot_pid_distribution_over_time and has been dropped.)
     """
     tr = tr.copy()
     tr['unique_total'] = tr['unique_0'] + tr['unique_1']
@@ -957,47 +1259,20 @@ def plot_stage_distribution_analysis(tr, channel, save_path=None):
         ('sr_ratio',      'Oranges','S / R Ratio'),
     ]
 
-    # ---------- Row 1: violins of raw per-window means ----------
-    # Per window: average across lag pairs
+    # Per window means (used to derive within-window CVs below).
     win_agg = tr.groupby(['stage', 'window'])[
         ['synergy', 'redundancy', 'unique_total', 'sr_ratio']
     ].mean().reset_index()
 
-    fig, axes = plt.subplots(3, len(metrics), figsize=(5 * len(metrics), 14))
+    fig, axes = plt.subplots(2, len(metrics), figsize=(5 * len(metrics), 9),
+                             constrained_layout=True)
 
-    for ci, (metric, cmap, label) in enumerate(metrics):
-        ax = axes[0, ci]
-        groups = [win_agg.loc[win_agg['stage'] == s, metric].dropna().values
-                  for s in present]
-        parts = ax.violinplot([g for g in groups if len(g) > 0],
-                              positions=range(len(present)),
-                              showmeans=True, showmedians=True, showextrema=False)
-        for i, pc in enumerate(parts['bodies']):
-            pc.set_facecolor(STAGE_COLORS[present[i]])
-            pc.set_alpha(0.6)
-        parts['cmeans'].set_color('black')
-        parts['cmedians'].set_color('grey')
-
-        # Levene's test
-        valid = [g for g in groups if len(g) >= 2]
-        if len(valid) >= 2:
-            stat_l, p_l = levene(*valid)
-            stars = '***' if p_l < 0.001 else '**' if p_l < 0.01 else '*' if p_l < 0.05 else 'ns'
-            ax.set_title(f'{label}\nLevene: W={stat_l:.1f}, p={p_l:.1e} {stars}',
-                         fontweight='bold', fontsize=10)
-        else:
-            ax.set_title(label, fontweight='bold', fontsize=10)
-        ax.set_xticks(range(len(present)))
-        ax.set_xticklabels(present)
-        ax.set_ylabel('bits' if metric != 'sr_ratio' else 'ratio')
-        ax.grid(axis='y', alpha=0.3)
-
-    # ---------- Row 2: per-window CV with bootstrap CI ----------
+    # ---------- Row 1: per-window CV with bootstrap CI ----------
     rng = np.random.default_rng(42)
     n_boot = 1000
 
     for ci, (metric, cmap, label) in enumerate(metrics):
-        ax = axes[1, ci]
+        ax = axes[0, ci]
         cv_groups = {}
         cv_means, cv_lo, cv_hi = [], [], []
         for stage in present:
@@ -1029,21 +1304,33 @@ def plot_stage_distribution_analysis(tr, channel, save_path=None):
         colors_bar = [STAGE_COLORS[s] for s in present]
         errs = np.array([[m - lo, hi - m]
                          for m, lo, hi in zip(cv_means, cv_lo, cv_hi)]).T
-        ax.bar(x, cv_means, color=colors_bar, edgecolor='white', alpha=0.85)
-        ax.errorbar(x, cv_means, yerr=errs, fmt='none', ecolor='black', capsize=4, lw=1.2)
-        ax.set_xticks(x); ax.set_xticklabels(present)
-        ax.set_ylabel('CV (std / mean)')
+        ax.bar(x, cv_means, color=colors_bar, edgecolor='white',
+               alpha=0.9, linewidth=1.2)
+        ax.errorbar(x, cv_means, yerr=errs, fmt='none', ecolor='#222',
+                    capsize=4, lw=1.3)
+        ax.set_xticks(x); ax.set_xticklabels(present, fontsize=11)
+        ax.set_ylabel('CV  (std / mean)', fontsize=11)
         ax.grid(axis='y', alpha=0.3)
+        ax.tick_params(axis='y', labelsize=10)
+
+        # Tight y-limits with headroom for brackets.
+        valid_cv = [v for v in cv_means if not np.isnan(v)]
+        valid_lo = [v for v in cv_lo if not np.isnan(v)]
+        valid_hi = [v for v in cv_hi if not np.isnan(v)]
+        if valid_cv:
+            lo_v = min(valid_lo + valid_cv)
+            hi_v = max(valid_hi + valid_cv)
+            pad = max(0.05 * (hi_v - lo_v), 0.003)
+            ax.set_ylim(max(0, lo_v - pad), hi_v + 7 * pad)
 
         # KW on per-window CVs
         grp_list = [v for v in cv_groups.values() if len(v) >= 2]
         if len(grp_list) >= 2:
             H, p = kruskal(*grp_list)
             stars = '***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'ns'
-            ax.set_title(f'{label} — within-window CV\nKW: H={H:.1f}, p={p:.1e} {stars}',
-                         fontweight='bold', fontsize=10)
+            ax.set_title(f'{label}\nKW: H={H:.1f}, p={p:.1e} {stars}',
+                         fontweight='bold', fontsize=11)
 
-            # pairwise Mann-Whitney on CVs
             pairs = list(combinations([s for s in present if s in cv_groups], 2))
             pvals = []
             for s1, s2 in pairs:
@@ -1053,45 +1340,76 @@ def plot_stage_distribution_analysis(tr, channel, save_path=None):
                 else:
                     pvals.append(1.0)
             adj_p = benjamini_hochberg(np.array(pvals))
-            # annotate top-3 significant
             sig = [(pairs[i], adj_p[i]) for i in range(len(pairs)) if adj_p[i] < 0.05]
             sig.sort(key=lambda x: x[1])
-            y_max = max([m for m in cv_means if not np.isnan(m)], default=0)
+            # Position brackets in the top band of the current ylim so they
+            # always render inside the panel regardless of data scale.
+            yl0, yl1 = ax.get_ylim()
+            span = yl1 - yl0
+            top_band_start = yl0 + 0.78 * span
+            step = 0.06 * span
             for rank, ((s1, s2), pv) in enumerate(sig[:3]):
                 i1, i2 = present.index(s1), present.index(s2)
-                y = y_max * (1.05 + rank * 0.08)
-                ax.plot([i1, i1, i2, i2], [y * 0.98, y, y, y * 0.98], lw=1, c='grey')
+                y = top_band_start + rank * step
+                ax.plot([i1, i1, i2, i2],
+                        [y - 0.012 * span, y, y, y - 0.012 * span],
+                        lw=1.0, c='#444', clip_on=False)
                 star = '***' if pv < 0.001 else '**' if pv < 0.01 else '*'
-                ax.text((i1 + i2) / 2, y, star, ha='center', va='bottom', fontsize=9)
+                ax.text((i1 + i2) / 2, y + 0.005 * span, star,
+                        ha='center', va='bottom', fontsize=10,
+                        fontweight='bold', clip_on=False)
         else:
-            ax.set_title(f'{label} — within-window CV', fontweight='bold', fontsize=10)
+            ax.set_title(label, fontweight='bold', fontsize=11)
 
-    # ---------- Row 3: CV profile across lag pairs ----------
+    # ---------- Row 2: CV profile across lag pairs ----------
+    def _smooth(arr, win=7):
+        arr = np.asarray(arr, dtype=float)
+        if win < 2 or len(arr) <= win:
+            return arr.copy()
+        pad = win // 2
+        padded = np.pad(arr, pad, mode='edge')
+        return np.convolve(padded, np.ones(win) / win, mode='valid')[:len(arr)]
+
+    legend_handles = []; legend_labels = []
     for ci, (metric, cmap, label) in enumerate(metrics):
-        ax = axes[2, ci]
+        ax = axes[1, ci]
         for stage in present:
             sub = tr[(tr['stage'] == stage) & tr[metric].notna()]
             if sub.empty:
                 continue
-            # group by lag pair, compute CV across windows
-            lag_cv = sub.groupby(['lag1_min', 'lag2_min'])[metric].agg(['mean', 'std']).reset_index()
-            lag_cv['cv'] = np.where(lag_cv['mean'] > 0, lag_cv['std'] / lag_cv['mean'], np.nan)
+            lag_cv = sub.groupby(['lag1_min', 'lag2_min'])[metric].agg(
+                ['mean', 'std']).reset_index()
+            lag_cv['cv'] = np.where(lag_cv['mean'] > 0,
+                                    lag_cv['std'] / lag_cv['mean'], np.nan)
             lag_cv['mean_lag'] = (lag_cv['lag1_min'] + lag_cv['lag2_min']) / 2
             grp = lag_cv.groupby('mean_lag')['cv'].mean().reset_index()
-            ax.plot(grp['mean_lag'], grp['cv'], color=STAGE_COLORS[stage],
-                    lw=2, label=stage, alpha=0.85)
-        ax.set_xlabel('Mean lag (min)')
-        ax.set_ylabel('CV across windows')
-        ax.set_title(f'{label} — CV by timescale', fontweight='bold', fontsize=10)
+            grp = grp.sort_values('mean_lag').reset_index(drop=True)
+            x = grp['mean_lag'].values
+            y = grp['cv'].values
+            ax.plot(x, y, color=STAGE_COLORS[stage],
+                    lw=0.9, alpha=0.25, zorder=1)
+            h, = ax.plot(x, _smooth(y, win=7), color=STAGE_COLORS[stage],
+                         lw=2.4, alpha=0.95, zorder=3, label=stage)
+            if ci == 0 and stage not in legend_labels:
+                legend_handles.append(h); legend_labels.append(stage)
+        ax.set_xlabel('Mean lag (min)', fontsize=11)
+        ax.set_ylabel('CV across windows', fontsize=11)
+        ax.set_title(f'{label} — CV by timescale',
+                     fontweight='bold', fontsize=11)
         ax.grid(alpha=0.3)
-        if ci == 0:
-            ax.legend(fontsize=8)
+        ax.tick_params(labelsize=10)
 
-    plt.suptitle(f'Distributional analysis across stages ({channel})',
-                 fontsize=14, fontweight='bold', y=1.01)
-    plt.tight_layout()
+    if legend_handles:
+        fig.legend(legend_handles, legend_labels,
+                   loc='lower center', ncol=len(legend_labels),
+                   frameon=False, fontsize=11,
+                   bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle(
+        f'Within-stage variability of PID atoms — {channel}',
+        fontsize=13, fontweight='bold')
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
         plt.close()
 
 
@@ -1152,8 +1470,12 @@ def plot_cross_electrode_comparison(all_data, save_path=None):
 # MAIN
 # =============================================================================
 
-def generate_plots_for_channel(data, chash):
-    """Generate all 15 plots for one channel."""
+def generate_plots_for_channel(data, chash, force=False):
+    """Generate all 16+1 plots for one channel.
+
+    Each plot has its own existence check against its target PNG, so partial
+    runs (e.g. after a mid-loop crash) resume from where they stopped.
+    """
     ch = data['channel']
     ch_dir = data['ch_dir']
     tr = data['tr']
@@ -1166,69 +1488,91 @@ def generate_plots_for_channel(data, chash):
 
     print(f"\n  Plotting {ch} …")
 
-    print(f"    1/16 Global PID matrix")
+    def _do(label, fname, fn, *args, **kwargs):
+        """Call fn(*args, save_path=ch_dir/fname) unless the file already exists."""
+        path = ch_dir / fname
+        if path.exists() and not force:
+            print(f"    {label} → cached")
+            return
+        print(f"    {label}")
+        fn(*args, save_path=path, **kwargs)
+
+    # Plot ordering mirrors docs/EEG_SLEEP_TEMPORAL_PID.md exactly.
+
     if data['global'] is not None:
-        plot_global_matrix(data['global'], ch, save_path=ch_dir / f"global_pid_matrix_{h}.png")
+        _do("1/16 Global PID matrix", f"global_pid_matrix_{h}.png",
+            plot_global_matrix, data['global'], ch)
 
-    print(f"    2/16 Combined time series")
+    # Plot 2 in the report = "Hypnogram + PID time series" — same plot as
+    # combined_timeseries (the hypnogram is the top panel, atoms below).
     if data['ar1_tr'] is not None and stage_labels is not None:
-        plot_combined_timeseries(tr, data['ar1_tr'], stage_labels, ch,
-                                save_path=ch_dir / f"combined_timeseries_{h}.png")
+        _do("2/16 Hypnogram + PID time series", f"hypnogram_pid_timeseries_{h}.png",
+            plot_combined_timeseries, tr, data['ar1_tr'], stage_labels, ch)
 
-    print(f"    3/16 Time × Lag heatmaps")
     if stage_labels is not None:
-        plot_time_lag_heatmaps(tr, stage_labels, ch, save_path=ch_dir / f"time_lag_heatmaps_{h}.png")
+        _do("3/16 Time × Lag heatmaps", f"time_lag_heatmaps_{h}.png",
+            plot_time_lag_heatmaps, tr, stage_labels, ch)
 
-    print(f"    4/16 Stage comparison")
-    plot_stage_comparison(tr, ch, save_path=ch_dir / f"stage_comparison_{h}.png")
+    _do("4/16 Stage comparison", f"stage_comparison_{h}.png",
+        plot_stage_comparison, tr, ch)
 
-    print(f"    5/16 Lag-difference heatmap")
     if stage_labels is not None:
-        plot_lagdiff_heatmap(tr, stage_labels, ch, save_path=ch_dir / f"lagdiff_heatmap_{h}.png")
+        _do("5/16 PID distribution over time", f"pid_distribution_over_time_{h}.png",
+            plot_pid_distribution_over_time, tr, stage_labels, ch)
 
-    print(f"    6/16 Global PID vs AR(1)")
+    if stage_labels is not None:
+        _do("6/16 Lag-difference heatmap", f"lagdiff_heatmap_{h}.png",
+            plot_lagdiff_heatmap, tr, stage_labels, ch)
+
     if data['global'] is not None and data['ar1_global'] is not None:
-        plot_global_matrix_vs_ar1(data['global'], data['ar1_global'], ch,
-                                  save_path=ch_dir / f"global_pid_vs_ar1_{h}.png")
+        _do("7/16 Global PID vs AR(1)", f"global_pid_vs_ar1_{h}.png",
+            plot_global_matrix_vs_ar1, data['global'], data['ar1_global'], ch)
 
-    print(f"    7/16 Stage comparison vs AR(1)")
+    if data['ar1_global'] is not None:
+        _do("7b/16 Per-stage PID excess vs stage-AR(1)",
+            f"global_pid_vs_ar1_per_stage_{h}.png",
+            plot_global_pid_vs_ar1_per_stage, tr, data['ar1_global'], ch)
+
+    if data['ar1_tr'] is not None and stage_labels is not None:
+        _do("8/16 Time series vs AR(1)", f"timeseries_vs_ar1_{h}.png",
+            plot_timeseries_vs_ar1, tr, data['ar1_tr'], stage_labels, ch)
+
     if data['ar1_tr'] is not None:
-        plot_stage_comparison_vs_ar1(tr, data['ar1_tr'], ch,
-                                     save_path=ch_dir / f"stage_comparison_vs_ar1_{h}.png")
+        _do("9/16 Stage comparison vs AR(1)", f"stage_comparison_vs_ar1_{h}.png",
+            plot_stage_comparison_vs_ar1, tr, data['ar1_tr'], ch)
 
-    print(f"    8/16 Autocorrelation vs PID")
     if data['autocorr'] is not None and stage_labels is not None:
-        plot_autocorrelation_vs_pid(data['autocorr'], tr, stage_labels, ch,
-                                    save_path=ch_dir / f"autocorrelation_vs_pid_{h}.png")
+        _do("10/16 Autocorrelation vs PID", f"autocorrelation_vs_pid_{h}.png",
+            plot_autocorrelation_vs_pid, data['autocorr'], tr, stage_labels, ch)
 
-    print(f"    9/16 S/R ratio vs Autocorrelation")
     if data['autocorr'] is not None:
-        plot_sr_ratio_vs_autocorr(data['autocorr'], tr, ch,
-                                  save_path=ch_dir / f"sr_ratio_vs_autocorr_{h}.png")
+        _do("11/16 S/R ratio vs Autocorrelation", f"sr_ratio_vs_autocorr_{h}.png",
+            plot_sr_ratio_vs_autocorr, data['autocorr'], tr, ch)
 
-    print(f"   10/16 PID per-stage matrices")
-    plot_pid_per_stage_matrix(tr, ch, save_path=ch_dir / f"pid_per_stage_matrix_{h}.png")
+    _do("12/16 PID per-stage matrices", f"pid_per_stage_matrix_{h}.png",
+        plot_pid_per_stage_matrix, tr, ch)
 
-    print(f"   11/16 Atom fractions")
-    plot_atom_fractions(tr, ch, save_path=ch_dir / f"atom_fractions_{h}.png")
+    _do("13/16 Timescale decay", f"timescale_decay_{h}.png",
+        plot_timescale_decay, tr, ch)
 
-    print(f"   12/16 NREM→REM cycles")
+    _do("14/16 Atom fractions", f"atom_fractions_{h}.png",
+        plot_atom_fractions, tr, ch)
+
     if stage_labels is not None:
-        plot_nrem_rem_cycles(tr, stage_labels, ch, save_path=ch_dir / f"nrem_rem_cycles_{h}.png")
+        _do("15/16 NREM→REM cycles", f"nrem_rem_cycles_{h}.png",
+            plot_nrem_rem_cycles, tr, stage_labels, ch)
 
-    print(f"   13/16 Effect sizes")
-    plot_effect_sizes(tr, ch, save_path=ch_dir / f"effect_sizes_{h}.png")
+    _do("16/16 Effect sizes", f"effect_sizes_{h}.png",
+        plot_effect_sizes, tr, ch)
 
-    print(f"   14/16 Block-permutation significance")
+    # Supplementary plots — not part of the main report numbering.
     if data['global'] is not None and data['null_vals'] is not None:
-        plot_block_permutation(data['global'], data['null_vals'], ch,
-                               save_path=ch_dir / f"block_permutation_{h}.png")
-
-    print(f"   15/16 Optimal timescales")
-    plot_optimal_timescales(tr, ch, save_path=ch_dir / f"optimal_timescales_{h}.png")
-
-    print(f"   16/16 Distribution analysis")
-    plot_stage_distribution_analysis(tr, ch, save_path=ch_dir / f"stage_distributions_{h}.png")
+        _do("S1 Block-permutation significance", f"block_permutation_{h}.png",
+            plot_block_permutation, data['global'], data['null_vals'], ch)
+    _do("S2 Optimal timescales", f"optimal_timescales_{h}.png",
+        plot_optimal_timescales, tr, ch)
+    _do("S3 Stage distribution analysis", f"stage_distributions_{h}.png",
+        plot_stage_distribution_analysis, tr, ch)
 
     print(f"  ✓ {ch} done — {ch_dir}")
 
@@ -1296,14 +1640,10 @@ def main():
                 if data is not None:
                     all_data.append(data)
 
-        # Generate per-channel plots (skip if first plot already exists, unless --force)
+        # Generate per-channel plots. Each plot has its own cache check;
+        # `--force` re-renders every plot.
         for data in all_data:
-            ch_dir = data['ch_dir']
-            first_plot = ch_dir / f"global_pid_matrix_{chash}.png"
-            if first_plot.exists() and not args.force:
-                print(f"  {data['channel']}: plots exist, skipping (use --force to regenerate)")
-                continue
-            generate_plots_for_channel(data, chash)
+            generate_plots_for_channel(data, chash, force=args.force)
             total_plotted += 1
 
         # Cross-electrode comparison

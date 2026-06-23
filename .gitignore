@@ -45,10 +45,8 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Data files (optional - uncomment if you don't want to track data)
-# data/*.csv
-# data/*.edf
+# Data (raw datasets, reproducible from OpenNeuro / source)
+data/
 
-# Large result files (optional - uncomment to ignore)
-# results/**/*.csv
-# results/**/*.png
+# Generated analysis artifacts (large; reproducible from scripts)
+results/

@@ -52,3 +52,6 @@ Thumbs.db
 # Large result files (optional - uncomment to ignore)
 # results/**/*.csv
 # results/**/*.png
+
+results/
+paper/

@@ -5,6 +5,14 @@ EEG Sleep Temporal PID — Compute CSVs across electrodes
 Runs the PID computation pipeline for all 6 PSG EEG electrodes
 (F3, F4, C3, C4, O1, O2) and saves per-electrode CSV/NPZ results.
 
+Current pass: **1-s windows, broadband, lags up to 30 s** — addresses
+Pedro's point that 30-s block shuffling tells us little (block shuffles now
+operate on 1-s blocks) and that the lag range should be EEG-relevant.
+
+The AR(1) baseline is now **stage-conditional**: φ and σ are fit per
+sleep-stage cohort, and the AR(1) PID matrix is computed once per stage and
+then matched to each target window's stage.
+
 No plotting — see eeg_sleep_plot.py for visualisation.
 
 Usage:
@@ -24,6 +32,15 @@ import warnings
 import argparse
 import hashlib
 import json
+
+# Windows consoles default to cp1252 and crash on print statements that contain
+# Unicode arrows, Greek letters, etc. Force UTF-8 (or fall back to a replace-
+# strategy) so a stray glyph never aborts a 2-hour compute.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 warnings.filterwarnings('ignore')
 
@@ -47,25 +64,42 @@ from dit import Distribution
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent.parent
 DATA_DIR = PROJECT_DIR / "data" / "ds005555"
-RESULTS_DIR = PROJECT_DIR / "results" / "pid" / "eeg_sleep"
+# Multi-subject pass: write each subject under PID-10-subjects-1sec/<subject>/.
+RESULTS_DIR = PROJECT_DIR / "results" / "pid" / "eeg_sleep" / "PID-10-subjects-1sec"
+_SKIP_BLOCK_PERM = False  # toggled per-channel by run_channel()
 
 SUBJECT = "sub-1"
 ALL_EEG_CHANNELS = ["PSG_F3", "PSG_F4", "PSG_C3", "PSG_C4", "PSG_O1", "PSG_O2"]
-DURATION_HOURS = 5
-WINDOW_SEC = 30
-MAX_LAG_MIN = 10
-N_BINS = 6
+ALL_SUBJECTS = [f"sub-{i}" for i in range(1, 11)]
+DURATION_HOURS = 3.5
+
+# Short-window pass: 1-s windows, lags up to 30 s.
+# MAX_LAG_MIN is expressed in minutes (0.5 = 30 s) to keep the rest of the
+# pipeline (column names, plot axes) unchanged.
+WINDOW_SEC = 1
+MAX_LAG_MIN = 0.5
+N_BINS = 4
 DISCRETIZE_PER_WINDOW = True
-CONTINUOUS_STAGE_FILTER = False
+# Hypnogram is scored in 30-s blocks. With 1-s windows and lags up to 30 s,
+# require every window in the span source2..target to share the same stage so
+# that a triplet cannot straddle a stage boundary.
+CONTINUOUS_STAGE_FILTER = True
+# Stride for the time-resolved PID target windows. step=1 → estimate at every
+# 1-s window (very expensive at this resolution); step=3 → every 3 s, etc.
+# Each PID estimate still uses the full 1-s window of samples — the stride only
+# thins the time-axis of estimates, it does not drop samples within an estimate.
+TARGET_STEP = 3
 
 # Band-filtered PID: set to None for broadband, or a dict of {name: (lo, hi)} in Hz
-# Example: {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 13), "sigma": (11, 16), "beta": (16, 30)}
-BANDS = None
-BANDS = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 13), "sigma": (11, 16), "beta": (16, 30)}
+# For the band-resolved pass we sweep delta..beta.
+BANDS = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 13),
+         "sigma": (11, 16), "beta": (16, 30)}
 
-WINDOWS_PER_MIN = 60 // WINDOW_SEC
-MIN_PER_WINDOW = WINDOW_SEC / 60
-MAX_LAG_WINDOWS = MAX_LAG_MIN * WINDOWS_PER_MIN
+# Lag-pair geometry — these expressions assume integer windows-per-minute. Keep
+# in floats so MAX_LAG_MIN < 1 works.
+WINDOWS_PER_MIN = 60.0 / WINDOW_SEC
+MIN_PER_WINDOW = WINDOW_SEC / 60.0
+MAX_LAG_WINDOWS = int(round(MAX_LAG_MIN * WINDOWS_PER_MIN))
 
 STAGE_ORDER = ['Wake', 'N1', 'N2', 'N3', 'REM']
 
@@ -74,7 +108,7 @@ def config_hash():
     """Short hash of analysis parameters for cache invalidation."""
     bands_str = "_".join(f"{k}{lo}-{hi}" for k, (lo, hi) in sorted(BANDS.items())) if BANDS else "broadband"
     params = (f"{WINDOW_SEC}_{MAX_LAG_MIN}_{N_BINS}_{DISCRETIZE_PER_WINDOW}"
-              f"_{CONTINUOUS_STAGE_FILTER}_{DURATION_HOURS}_{bands_str}")
+              f"_{CONTINUOUS_STAGE_FILTER}_{DURATION_HOURS}_{TARGET_STEP}_{bands_str}")
     return hashlib.md5(params.encode()).hexdigest()[:8]
 
 
@@ -91,6 +125,7 @@ def save_params(chash):
         "DISCRETIZE_PER_WINDOW": DISCRETIZE_PER_WINDOW,
         "CONTINUOUS_STAGE_FILTER": CONTINUOUS_STAGE_FILTER,
         "DURATION_HOURS": DURATION_HOURS,
+        "TARGET_STEP": TARGET_STEP,
         "BANDS": BANDS,
     }
     with open(params_file, 'w') as f:
@@ -305,8 +340,69 @@ def detect_bad_windows(signal, fs, window_sec, flat_threshold=1e-10):
 # PID COMPUTATION
 # =============================================================================
 
+def _safe_mi_2d(p_xy, p_x, p_y):
+    """I(X;Y) in bits from a 2-D joint and 1-D marginals (no support iteration)."""
+    px_py = p_x[:, None] * p_y[None, :]
+    mask = (p_xy > 0) & (px_py > 0)
+    if not mask.any():
+        return 0.0
+    return float(np.sum(p_xy[mask] * np.log2(p_xy[mask] / px_py[mask])))
+
+
 def compute_pid_from_arrays(src1, src2, target, n_bins=4):
-    """Compute PID-MMI from three aligned integer arrays."""
+    """PID-MMI from three aligned integer arrays — numpy-only closed form.
+
+    MMI redundancy: R = min(I(S1;T), I(S2;T))
+    Unique_i      : U_i = I(S_i;T) − R
+    Synergy       : S = I(S1,S2;T) − I(S1;T) − I(S2;T) + R
+
+    Equivalent to dit's PID_MMI but ~100× faster — dit builds a Distribution
+    object and a lattice on every call; here it's a single bincount + a few
+    numpy reductions. See `compute_pid_from_arrays_dit` for the reference
+    implementation used by the sanity check.
+    """
+    if len(target) == 0:
+        return dict(redundancy=np.nan, synergy=np.nan,
+                    unique_0=np.nan, unique_1=np.nan)
+
+    nb = int(n_bins)
+    codes = (src1.astype(np.int64) * nb * nb +
+             src2.astype(np.int64) * nb +
+             target.astype(np.int64))
+    counts = np.bincount(codes, minlength=nb ** 3)
+    total = counts.sum()
+    if total == 0:
+        return dict(redundancy=np.nan, synergy=np.nan,
+                    unique_0=np.nan, unique_1=np.nan)
+
+    p = counts.reshape(nb, nb, nb).astype(np.float64) / float(total)
+    # Marginals
+    p_s1 = p.sum(axis=(1, 2))
+    p_s2 = p.sum(axis=(0, 2))
+    p_t  = p.sum(axis=(0, 1))
+    p_s1_t = p.sum(axis=1)        # (s1, t)
+    p_s2_t = p.sum(axis=0)        # (s2, t)
+    p_s1s2 = p.sum(axis=2)        # (s1, s2)
+
+    I_s1_t  = _safe_mi_2d(p_s1_t, p_s1, p_t)
+    I_s2_t  = _safe_mi_2d(p_s2_t, p_s2, p_t)
+    # I((S1,S2); T) — treat (s1, s2) as a joint variable
+    I_joint = _safe_mi_2d(p.reshape(nb * nb, nb),
+                          p_s1s2.reshape(-1), p_t)
+
+    redundancy = min(I_s1_t, I_s2_t)
+    unique_0   = max(I_s1_t - redundancy, 0.0)
+    unique_1   = max(I_s2_t - redundancy, 0.0)
+    synergy    = max(I_joint - I_s1_t - I_s2_t + redundancy, 0.0)
+
+    return dict(redundancy=float(redundancy),
+                unique_0=float(unique_0),
+                unique_1=float(unique_1),
+                synergy=float(synergy))
+
+
+def compute_pid_from_arrays_dit(src1, src2, target, n_bins=4):
+    """Reference dit-based PID-MMI — slow, kept for sanity checks."""
     codes = src1.astype(int) * n_bins * n_bins + src2.astype(int) * n_bins + target.astype(int)
     counts = np.bincount(codes, minlength=n_bins ** 3)
     total = counts.sum()
@@ -348,7 +444,7 @@ def compute_pid_from_arrays(src1, src2, target, n_bins=4):
 def compute_global_pid_matrix(signal_disc, fs, max_lag_min, window_sec):
     """PID for every lag pair using ALL valid sample triplets."""
     W = int(window_sec * fs)
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     min_per_w = window_sec / 60
     n_pairs = max_lag_w * (max_lag_w - 1) // 2
     results, done = [], 0
@@ -372,17 +468,24 @@ def compute_global_pid_matrix(signal_disc, fs, max_lag_min, window_sec):
 
 
 def compute_timeresolved_pid(signal_disc, fs, max_lag_min, window_sec,
-                             good_windows=None):
-    """PID in sliding windows for every lag pair."""
+                             good_windows=None, step=1):
+    """PID in sliding windows for every lag pair.
+
+    `step` strides the *target* time-axis: step=1 estimates at every window,
+    step=3 estimates every 3 windows. Each estimate still uses the full
+    `window_sec * fs` samples of the target + both source windows — the stride
+    only thins the time-series of estimates, never the samples that go into
+    one estimate.
+    """
     W = int(window_sec * fs)
     n_windows = len(signal_disc) // W
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     min_per_w = window_sec / 60
     first = max_lag_w
     n_pairs = max_lag_w * (max_lag_w - 1) // 2
 
     valid_targets = []
-    for t in range(first, n_windows):
+    for t in range(first, n_windows, max(1, int(step))):
         if good_windows is not None:
             needed = [t] + [t - lag_w for lag_w in range(1, max_lag_w + 1)]
             if not all(good_windows[w] for w in needed if w < len(good_windows)):
@@ -409,18 +512,177 @@ def compute_timeresolved_pid(signal_disc, fs, max_lag_min, window_sec,
                 pid['lag1_min'] = round(lag1 * min_per_w, 4)
                 pid['lag2_min'] = round(lag2 * min_per_w, 4)
                 results.append(pid)
-        if (idx + 1) % 5 == 0 or idx == len(valid_targets) - 1:
+        if (idx + 1) % 50 == 0 or idx == len(valid_targets) - 1:
             elapsed = time.time() - t0
             rate = elapsed / (idx + 1)
             eta  = rate * (len(valid_targets) - idx - 1)
             print(f"    window {idx+1}/{len(valid_targets)}  "
-                  f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]")
+                  f"[{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining]",
+                  flush=True)
     return pd.DataFrame(results)
 
 
 # =============================================================================
 # AR(1) BASELINE + AUTOCORRELATION
 # =============================================================================
+
+def _fit_ar1_window_level(data_subset):
+    """Fit window-level AR(1) (φ, σ) from a (n_rows, W) discretised matrix.
+
+    φ is estimated by averaging the lag-1 across-window autocorrelation at
+    several within-window positions; σ is set to recover the marginal variance.
+    Returns (phi, sigma, mean_per_position).
+    """
+    n_rows, W = data_subset.shape
+    n_pos = min(W, 500)
+    pos_idx = np.linspace(0, W - 1, n_pos, dtype=int)
+    phis = []
+    for j in pos_idx:
+        col = data_subset[:, j]
+        col_z = col - col.mean()
+        denom = np.dot(col_z[:-1], col_z[:-1])
+        if denom > 0:
+            phis.append(np.dot(col_z[1:], col_z[:-1]) / denom)
+    phi = float(np.mean(phis)) if phis else 0.0
+    sigma = float(np.std(data_subset)) * np.sqrt(max(1 - phi ** 2, 0.01))
+    return phi, sigma
+
+
+def _simulate_ar1_pid_matrix(phi, sigma, mean_val, std_val,
+                             n_windows, W, max_lag_w, min_per_w,
+                             n_bins, n_realisations, rng, label="",
+                             max_ar_windows=1500):
+    """Generate AR(1) symbol stream and return mean/std PID over lag pairs.
+
+    Performance notes for the 1-s pass:
+    - `max_ar_windows` caps the synthetic signal length to bound wall-time.
+      1500 windows → 384k samples per lag pair, well above the regime where
+      the PID estimate has stabilised at n_bins=4.
+    - The synthetic AR(1) is binned with a SINGLE global quantile rule rather
+      than per-window. The per-window binning on the real signal exists to
+      remove amplitude drift; the synthetic AR(1) has no drift to remove, so
+      a global rule is methodologically appropriate and ~100× faster than the
+      Python-level per-window digitize loop.
+    """
+    n_ar = min(int(n_windows), int(max_ar_windows))
+
+    lag_pairs = [(l1, l2) for l1 in range(1, max_lag_w)
+                 for l2 in range(l1 + 1, max_lag_w + 1)]
+    n_pairs = len(lag_pairs)
+    all_vals = np.zeros((n_realisations, n_pairs, 4))
+
+    for rep in range(n_realisations):
+        noise = rng.normal(0, max(sigma, 1e-6), (n_ar, W))
+        noise[0, :] = rng.normal(mean_val, max(std_val, 1e-6), W)
+        ar_cont = lfilter([1], [1, -phi], noise, axis=0)
+        ar_cont += mean_val
+
+        # Global quantile binning of the synthetic AR(1) stream (no per-window
+        # loop — see docstring). One np.digitize on the full flat signal.
+        ar_flat_cont = ar_cont.ravel()
+        edges = np.percentile(ar_flat_cont,
+                              np.linspace(0, 100, n_bins + 1))
+        edges = np.unique(edges)
+        if len(edges) < 3:
+            edges = np.linspace(ar_flat_cont.min() - 1e-10,
+                                ar_flat_cont.max() + 1e-10, n_bins + 1)
+        else:
+            edges[0] -= 1e-10
+            edges[-1] += 1e-10
+        ar_flat = np.digitize(ar_flat_cont, edges[1:-1]).astype(np.int8)
+
+        for lag_idx, (lag1, lag2) in enumerate(lag_pairs):
+            off1 = lag1 * W
+            off2 = lag2 * W
+            n_valid = len(ar_flat) - off2
+            target = ar_flat[off2: off2 + n_valid]
+            src1   = ar_flat[off2 - off1: off2 - off1 + n_valid]
+            src2   = ar_flat[0: n_valid]
+            pid = compute_pid_from_arrays(src1, src2, target, n_bins)
+            all_vals[rep, lag_idx] = [pid['redundancy'], pid['synergy'],
+                                      pid['unique_0'], pid['unique_1']]
+        print(f"    {label}AR(1) realisation {rep+1}/{n_realisations} "
+              f"(n_ar={n_ar} windows)", flush=True)
+
+    means = all_vals.mean(axis=0)
+    stds  = all_vals.std(axis=0)
+    records_mean, records_std = [], []
+    for i, (l1, l2) in enumerate(lag_pairs):
+        records_mean.append(dict(lag1_min=round(l1 * min_per_w, 4),
+                                 lag2_min=round(l2 * min_per_w, 4),
+                                 redundancy=means[i, 0], synergy=means[i, 1],
+                                 unique_0=means[i, 2], unique_1=means[i, 3]))
+        records_std.append(dict(lag1_min=round(l1 * min_per_w, 4),
+                                lag2_min=round(l2 * min_per_w, 4),
+                                redundancy=stds[i, 0], synergy=stds[i, 1],
+                                unique_0=stds[i, 2], unique_1=stds[i, 3]))
+    return pd.DataFrame(records_mean), pd.DataFrame(records_std)
+
+
+def compute_ar1_global_pid_stage_conditional(signal_disc, fs, max_lag_min,
+                                             window_sec, n_bins, stage_labels,
+                                             n_realisations=5, seed=42,
+                                             min_windows_per_stage=20):
+    """Stage-conditional window-level AR(1) baseline.
+
+    Fits φ, σ per sleep stage on that stage's windows only, then generates a
+    synthetic AR(1) of length n_windows with those parameters and computes
+    the PID matrix. Returns long-form DataFrames (with `stage` column) for
+    mean and std, and a dict of fit parameters per stage for logging.
+    """
+    rng = np.random.default_rng(seed)
+    W = int(window_sec * fs)
+    n_windows = len(signal_disc) // W
+    data = signal_disc[:n_windows * W].reshape(n_windows, W).astype(float)
+    stages_arr = np.array(stage_labels[:n_windows])
+
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
+    min_per_w = window_sec / 60
+
+    all_mean, all_std, fit_info = [], [], {}
+    for stage in STAGE_ORDER:
+        idx = np.where(stages_arr == stage)[0]
+        if len(idx) < min_windows_per_stage:
+            print(f"    [{stage}] only {len(idx)} windows — skipping AR(1) fit")
+            continue
+        subset = data[idx]
+        phi, sigma = _fit_ar1_window_level(subset)
+        mean_val = float(subset.mean())
+        std_val  = float(subset.std())
+        print(f"    [{stage}] n={len(idx)}  φ={phi:.4f}  σ={sigma:.4f}")
+        fit_info[stage] = dict(n_windows=int(len(idx)), phi=phi, sigma=sigma,
+                               mean=mean_val, std=std_val)
+
+        mean_df, std_df = _simulate_ar1_pid_matrix(
+            phi=phi, sigma=sigma, mean_val=mean_val, std_val=std_val,
+            n_windows=n_windows, W=W, max_lag_w=max_lag_w, min_per_w=min_per_w,
+            n_bins=n_bins, n_realisations=n_realisations, rng=rng,
+            label=f"[{stage}] ")
+        mean_df['stage'] = stage
+        std_df['stage']  = stage
+        all_mean.append(mean_df)
+        all_std.append(std_df)
+
+    if not all_mean:
+        # Defensive fallback: no stage met the threshold. Single global fit.
+        print("    No stage met the threshold — falling back to global AR(1)")
+        phi, sigma = _fit_ar1_window_level(data)
+        mean_df, std_df = _simulate_ar1_pid_matrix(
+            phi=phi, sigma=sigma, mean_val=float(data.mean()),
+            std_val=float(data.std()),
+            n_windows=n_windows, W=W, max_lag_w=max_lag_w, min_per_w=min_per_w,
+            n_bins=n_bins, n_realisations=n_realisations, rng=rng,
+            label="[global] ")
+        mean_df['stage'] = 'ALL'
+        std_df['stage']  = 'ALL'
+        all_mean.append(mean_df); all_std.append(std_df)
+        fit_info['ALL'] = dict(n_windows=int(n_windows), phi=phi, sigma=sigma,
+                               mean=float(data.mean()), std=float(data.std()))
+
+    return (pd.concat(all_mean, ignore_index=True),
+            pd.concat(all_std,  ignore_index=True),
+            fit_info)
+
 
 def compute_ar1_global_pid(signal_disc, fs, max_lag_min, window_sec, n_bins,
                            n_realisations=5, seed=42):
@@ -443,7 +705,7 @@ def compute_ar1_global_pid(signal_disc, fs, max_lag_min, window_sec, n_bins,
     sigma_w = np.std(data) * np.sqrt(max(1 - phi_w ** 2, 0.01))
     print(f"    Window-level AR(1): φ_w = {phi_w:.4f}, σ_w = {sigma_w:.4f}")
 
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     min_per_w = window_sec / 60
     lag_pairs = [(l1, l2) for l1 in range(1, max_lag_w)
                  for l2 in range(l1 + 1, max_lag_w + 1)]
@@ -497,13 +759,88 @@ def compute_ar1_global_pid(signal_disc, fs, max_lag_min, window_sec, n_bins,
     return pd.DataFrame(records_mean), pd.DataFrame(records_std)
 
 
+def compute_ar1_timeresolved_pid_stage_matched(signal_disc, fs, max_lag_min,
+                                               window_sec, n_bins,
+                                               stage_labels,
+                                               ar1_per_stage_mean,
+                                               good_windows=None, step=1):
+    """Stage-matched AR(1) baseline broadcast per window.
+
+    For each valid target window, looks up the AR(1) PID matrix for that
+    window's sleep stage and emits one row per lag pair. Windows whose stage
+    has no AR(1) fit (under-represented stages) fall through silently — they
+    will be dropped by the same-stage filter downstream.
+    """
+    W = int(window_sec * fs)
+    n_windows = len(signal_disc) // W
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
+    min_per_w = window_sec / 60
+    first = max_lag_w
+
+    # Pre-index AR(1) matrices by stage for fast lookup.
+    per_stage_rows = {
+        stg: grp.reset_index(drop=True)
+        for stg, grp in ar1_per_stage_mean.groupby('stage')
+    }
+    fallback = per_stage_rows.get('ALL')
+
+    valid_targets = []
+    for t in range(first, n_windows, max(1, int(step))):
+        if good_windows is not None:
+            needed = [t] + [t - lag_w for lag_w in range(1, max_lag_w + 1)]
+            if not all(good_windows[w] for w in needed if w < len(good_windows)):
+                continue
+        valid_targets.append(t)
+
+    print(f"    Broadcasting stage-matched AR(1) to {len(valid_targets)} windows",
+          flush=True)
+
+    # Vectorised broadcast: group targets by stage, then tile that stage's AR(1)
+    # rows across the targets. ~100× faster than the per-window iterrows loop.
+    from collections import defaultdict
+    targets_by_stage = defaultdict(list)
+    n_dropped = 0
+    for t in valid_targets:
+        stage = stage_labels[t] if t < len(stage_labels) else '?'
+        if stage not in per_stage_rows and fallback is None:
+            n_dropped += 1
+            continue
+        targets_by_stage[stage].append(t)
+
+    blocks = []
+    cols = ['lag1_min', 'lag2_min', 'redundancy', 'synergy', 'unique_0', 'unique_1']
+    for stage, targets in targets_by_stage.items():
+        rows = per_stage_rows.get(stage, fallback)
+        if rows is None or not targets:
+            continue
+        n_lp = len(rows)
+        n_t  = len(targets)
+        t_arr = np.repeat(np.asarray(targets, dtype=np.int64), n_lp)
+        tm    = np.round(t_arr * min_per_w, 4)
+        # Repeat the lag-pair × atom block for each target.
+        rep = pd.concat([rows[cols]] * n_t, ignore_index=True)
+        rep['window']    = t_arr
+        rep['time_min']  = tm
+        rep['stage_ar1'] = stage
+        blocks.append(rep)
+
+    if n_dropped:
+        print(f"    Dropped {n_dropped} target windows whose stage had no AR(1) fit",
+              flush=True)
+    if not blocks:
+        return pd.DataFrame(columns=[
+            'window', 'time_min', 'lag1_min', 'lag2_min',
+            'redundancy', 'synergy', 'unique_0', 'unique_1', 'stage_ar1'])
+    return pd.concat(blocks, ignore_index=True)
+
+
 def compute_ar1_timeresolved_pid(signal_disc, fs, max_lag_min, window_sec,
                                  n_bins, good_windows=None,
                                  ar1_global_mean=None):
     """AR(1) baseline per window — broadcasts global AR(1) mean."""
     W = int(window_sec * fs)
     n_windows = len(signal_disc) // W
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     min_per_w = window_sec / 60
     first = max_lag_w
 
@@ -535,7 +872,7 @@ def compute_autocorrelation_per_window(signal, fs, max_lag_min, window_sec):
     """Compute autocorrelation R(τ) per window for τ = 1..max_lag_windows."""
     W = int(window_sec * fs)
     n_windows = len(signal) // W
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     min_per_w = window_sec / 60
     records = []
     for w in range(n_windows):
@@ -575,7 +912,7 @@ def compute_block_permutation_null(signal_disc, fs, max_lag_min, window_sec,
     n_windows = len(signal_disc) // W
     data = signal_disc[:n_windows * W].reshape(n_windows, W)
 
-    max_lag_w = max_lag_min * (60 // window_sec)
+    max_lag_w = int(round(max_lag_min * 60.0 / window_sec))
     lag_pairs = [(l1, l2) for l1 in range(1, max_lag_w)
                  for l2 in range(l1 + 1, max_lag_w + 1)]
     n_pairs = len(lag_pairs)
@@ -636,11 +973,22 @@ def apply_same_stage_filter(df, stage_labels, continuous=False):
 # PER-CHANNEL PIPELINE
 # =============================================================================
 
-def run_channel(subject_dir, channel, chash):
-    """Run full compute pipeline for one electrode. Returns output dir."""
+def run_channel(subject_dir, channel, chash, subject=None, skip_block_perm=False):
+    """Run full compute pipeline for one electrode.
+
+    If `subject` is provided, results go to RESULTS_DIR/<subject>/<channel>/; otherwise
+    flat under RESULTS_DIR/<channel>/. `skip_block_perm` skips the block-permutation
+    null compute (the slow step at 1-s windows).
+    """
     ch_short = channel.replace("PSG_", "")
-    ch_dir = RESULTS_DIR / ch_short
+    if subject is not None:
+        ch_dir = RESULTS_DIR / subject / ch_short
+    else:
+        ch_dir = RESULTS_DIR / ch_short
     ch_dir.mkdir(parents=True, exist_ok=True)
+    # Stash these in module globals so _run_pipeline can read without a longer signature.
+    global _SKIP_BLOCK_PERM
+    _SKIP_BLOCK_PERM = skip_block_perm
 
     print(f"\n{'='*70}")
     print(f"  CHANNEL: {channel}")
@@ -722,7 +1070,9 @@ def _run_pipeline(signal, signal_disc, fs, good_windows, stage_labels,
     else:
         t0 = time.time()
         tr_results = compute_timeresolved_pid(signal_disc, fs, MAX_LAG_MIN,
-                                              WINDOW_SEC, good_windows=good_windows)
+                                              WINDOW_SEC,
+                                              good_windows=good_windows,
+                                              step=TARGET_STEP)
         print(f"    Done in {time.time()-t0:.1f}s")
         tr_results.to_csv(tr_csv, index=False)
 
@@ -735,30 +1085,38 @@ def _run_pipeline(signal, signal_disc, fs, good_windows, stage_labels,
     tr_filt_csv = ch_dir / f"timeresolved_pid_filtered_{chash}.csv"
     tr_results.to_csv(tr_filt_csv, index=False)
 
-    # ---- AR(1) baseline -----------------------------------------------------
-    print(f"\n  [{label}] AR(1) baseline …")
-    N_AR = 5
+    # ---- AR(1) baseline (stage-conditional) ---------------------------------
+    print(f"\n  [{label}] Stage-conditional AR(1) baseline …")
+    N_AR = 3
     ar1_mean_csv = ch_dir / f"ar1_global_pid_mean_{chash}.csv"
     ar1_std_csv  = ch_dir / f"ar1_global_pid_std_{chash}.csv"
-    if ar1_mean_csv.exists():
-        print("    Cached")
+    ar1_fit_json = ch_dir / f"ar1_fit_params_{chash}.json"
+    if ar1_mean_csv.exists() and 'stage' in pd.read_csv(ar1_mean_csv, nrows=1).columns:
+        print("    Cached (stage-conditional)")
         ar1_global_mean = pd.read_csv(ar1_mean_csv)
     else:
         t0 = time.time()
-        ar1_global_mean, ar1_global_std = compute_ar1_global_pid(
-            signal_disc, fs, MAX_LAG_MIN, WINDOW_SEC, N_BINS, n_realisations=N_AR)
+        ar1_global_mean, ar1_global_std, ar1_fit = \
+            compute_ar1_global_pid_stage_conditional(
+                signal_disc, fs, MAX_LAG_MIN, WINDOW_SEC, N_BINS,
+                stage_labels=stage_labels, n_realisations=N_AR)
         print(f"    Done in {time.time()-t0:.1f}s")
         ar1_global_mean.to_csv(ar1_mean_csv, index=False)
         ar1_global_std.to_csv(ar1_std_csv, index=False)
+        with open(ar1_fit_json, 'w') as f:
+            json.dump(ar1_fit, f, indent=2)
 
     ar1_tr_csv = ch_dir / f"ar1_timeresolved_pid_{chash}.csv"
     if ar1_tr_csv.exists():
         print("    Cached (time-resolved)")
         ar1_tr = pd.read_csv(ar1_tr_csv)
     else:
-        ar1_tr = compute_ar1_timeresolved_pid(
+        ar1_tr = compute_ar1_timeresolved_pid_stage_matched(
             signal_disc, fs, MAX_LAG_MIN, WINDOW_SEC, N_BINS,
-            good_windows=good_windows, ar1_global_mean=ar1_global_mean)
+            stage_labels=stage_labels,
+            ar1_per_stage_mean=ar1_global_mean,
+            good_windows=good_windows,
+            step=TARGET_STEP)
         ar1_tr.to_csv(ar1_tr_csv, index=False)
 
     # same-stage filter for AR(1)
@@ -781,6 +1139,9 @@ def _run_pipeline(signal, signal_disc, fs, good_windows, stage_labels,
         autocorr_df.to_csv(autocorr_csv, index=False)
 
     # ---- block permutation --------------------------------------------------
+    if _SKIP_BLOCK_PERM:
+        print(f"\n  [{label}] Block-permutation null skipped (--skip-block-perm)")
+        return
     print(f"\n  [{label}] Block-permutation null …")
     N_PERM = 100
     perm_npz = ch_dir / f"block_perm_null_{chash}.npz"
@@ -804,43 +1165,60 @@ def main():
         description="Compute PID CSVs across EEG electrodes")
     parser.add_argument('--channels', nargs='+', default=ALL_EEG_CHANNELS,
                         help=f"Channels to process (default: all 6)")
+    parser.add_argument('--subjects', nargs='+', default=[SUBJECT],
+                        help=f"Subjects to process (default: {SUBJECT}). "
+                             f"All 10: {' '.join(ALL_SUBJECTS)}")
+    parser.add_argument('--skip-block-perm', action='store_true',
+                        help="Skip the block-permutation null compute "
+                             "(saves ~37 min/channel at 1-s windows).")
     args = parser.parse_args()
 
     channels = args.channels
+    subjects = args.subjects
     chash = config_hash()
     save_params(chash)
 
     print("=" * 70)
-    print("EEG SLEEP — MULTI-ELECTRODE PID COMPUTATION")
+    print("EEG SLEEP — MULTI-SUBJECT × MULTI-ELECTRODE PID COMPUTATION")
     print(f"Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Subjects : {subjects}")
     print(f"Channels : {channels}")
     print(f"Config   : W={WINDOW_SEC}s, lags=1-{MAX_LAG_MIN}min, "
-          f"bins={N_BINS}, hash={chash}")
+          f"bins={N_BINS}, target_step={TARGET_STEP}, "
+          f"duration={DURATION_HOURS}h, hash={chash}")
+    print(f"Block-perm: {'SKIPPED' if args.skip_block_perm else 'enabled'}")
     if BANDS:
         print(f"Bands    : {', '.join(f'{k} ({lo}-{hi} Hz)' for k,(lo,hi) in BANDS.items())}")
     else:
         print(f"Bands    : broadband")
     print("=" * 70)
 
-    # Download data once
-    print(f"\nSTEP 1 — DOWNLOAD DATA")
-    subject_dir = download_subject(SUBJECT)
+    # Outer loop: subjects
+    for si, subject in enumerate(subjects):
+        print(f"\n{'%'*70}")
+        print(f"  SUBJECT {si+1}/{len(subjects)}: {subject}")
+        print(f"{'%'*70}")
 
-    # Process each channel
-    for i, ch in enumerate(channels):
-        print(f"\n{'#'*70}")
-        print(f"  ELECTRODE {i+1}/{len(channels)}: {ch}")
-        print(f"{'#'*70}")
-        run_channel(subject_dir, ch, chash)
+        # Download data for this subject (no-op if already present / symlinked)
+        print(f"\nSTEP 1 — DOWNLOAD DATA ({subject})")
+        subject_dir = download_subject(subject)
+
+        # Inner loop: channels
+        for i, ch in enumerate(channels):
+            print(f"\n{'#'*70}")
+            print(f"  {subject} | ELECTRODE {i+1}/{len(channels)}: {ch}")
+            print(f"{'#'*70}")
+            run_channel(subject_dir, ch, chash, subject=subject,
+                        skip_block_perm=args.skip_block_perm)
 
     print(f"\n{'='*70}")
-    print(f"ALL DONE — {len(channels)} electrodes processed")
+    print(f"ALL DONE — {len(subjects)} subjects × {len(channels)} electrodes")
     print(f"Results in {RESULTS_DIR}/")
-    for ch in channels:
-        ch_short = ch.replace("PSG_", "")
-        ch_dir = RESULTS_DIR / ch_short
-        n_files = len(list(ch_dir.glob("*")))
-        print(f"  {ch_short}/  ({n_files} files)")
+    for subject in subjects:
+        sub_dir = RESULTS_DIR / subject
+        if sub_dir.exists():
+            n_files = sum(1 for _ in sub_dir.rglob("*") if _.is_file())
+            print(f"  {subject}/  ({n_files} files)")
     print(f"Finished : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
